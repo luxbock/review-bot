@@ -1,0 +1,155 @@
+#!@PYTHON@
+"""review-bot-review — thin, credential-free CLIENT for the review-bot service.
+
+Same argv surface as the old in-process CLI (poll.py and every other caller
+migrate by doing nothing). Instead of running the engines in-process — which
+required the caller to hold the forge token and live LLM credentials
+(CLAUDE_CONFIG_DIR/CODEX_HOME) — it serializes the flags into a one-line JSON
+request, sends it to `review-bot-serve` over the Unix socket at
+$REVIEW_BOT_SOCKET (default /run/review-bot/review.sock), streams the NDJSON
+response, and mirrors the old CLI's stdout/exit-code contract:
+
+  --print-only  -> the review markdown on stdout;
+  otherwise     -> the posted comment URL on stdout;
+  exit 0 on success, 1 on failure (error detail on stderr).
+
+Progress ({"type":"log"}) events are relayed to stderr. The service holds all
+credentials; this process never sees them.
+
+`--repo-dir` cannot cross the service boundary (the service must not read
+arbitrary caller paths) — for that, run `review-bot-review-local` directly,
+which needs local credentials.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+
+SOCKET_PATH = os.environ.get("REVIEW_BOT_SOCKET", "/run/review-bot/review.sock")
+FOCUS_CAP = 2000  # keep in sync with serve.py (server truncates too)
+
+
+def die(msg, code=1):
+    print(f"review-bot-review: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def build_request(args):
+    """argv -> the whitelisted request object serve.py accepts. Mirrors the mode /
+    harness resolution the in-process main() does, so errors surface client-side."""
+    if args.repo_dir:
+        die(
+            "--repo-dir is not supported across the service boundary — the review-bot "
+            "service only reviews its own cache clones and must not read arbitrary "
+            "caller paths. For a local-checkout run use `review-bot-review-local` "
+            "directly (requires local forge + LLM credentials)."
+        )
+
+    mode = args.mode
+    if not mode:
+        mode = "issue" if (args.issue is not None and args.pr is None) else "pr"
+    if mode == "pr" and args.pr is None:
+        die("mode=pr requires --pr N")
+    if mode == "issue" and args.issue is None:
+        die("mode=issue requires --issue N")
+    number = args.pr if mode == "pr" else args.issue
+    if number <= 0:
+        die(f"--{'pr' if mode == 'pr' else 'issue'} must be a positive integer")
+
+    harnesses = [h.strip() for h in args.harness.split(",") if h.strip()]
+    for h in harnesses:
+        if h not in ("claude", "codex"):
+            die(f"unknown harness '{h}' (supported: claude, codex)")
+    if not harnesses:
+        die("no harness given")
+
+    return {
+        "mode": mode,
+        "owner": args.owner,
+        "repo": args.repo,
+        "number": number,
+        "harness": ",".join(harnesses),
+        "depth": args.depth,
+        "confidence_bar": args.confidence_bar,
+        "focus": args.focus[:FOCUS_CAP],
+        "print_only": args.print_only,
+        "dry_run": args.dry_run,
+    }
+
+
+def connect(path):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(path)
+    except FileNotFoundError:
+        die(
+            f"review-bot service socket not found at {path} — is review-bot.socket "
+            f"enabled on this host? (set REVIEW_BOT_SOCKET if it lives elsewhere)"
+        )
+    except (ConnectionRefusedError, PermissionError) as e:
+        die(
+            f"cannot connect to the review-bot service at {path} ({e}) — "
+            f"check `systemctl status review-bot.socket`"
+        )
+    return sock
+
+
+def main():
+    # Argv surface kept identical to the old in-process CLI (review.py main()).
+    ap = argparse.ArgumentParser(description="Run review-bot on a Forgejo PR or issue (via the review-bot service).")
+    ap.add_argument("--owner", required=True)
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--mode", default="", choices=["", "pr", "issue"], help="pr (default) | issue")
+    ap.add_argument("--pr", type=int, help="PR number (mode=pr)")
+    ap.add_argument("--issue", type=int, help="issue number (mode=issue)")
+    ap.add_argument("--harness", default="claude", help="claude | codex | claude,codex")
+    ap.add_argument("--depth", default="standard", choices=["quick", "standard", "deep"])
+    ap.add_argument("--focus", default="", help="advisory, untrusted focus directive")
+    ap.add_argument("--confidence-bar", default="", choices=["", "low", "medium", "high"])
+    ap.add_argument("--repo-dir", default="", help="unsupported here — see review-bot-review-local")
+    ap.add_argument("--dry-run", action="store_true", help="service prints prompt(s) to its journal, posts nothing")
+    ap.add_argument("--print-only", action="store_true", help="run engines but print markdown, don't POST")
+    args = ap.parse_args()
+
+    request = build_request(args)
+    sock = connect(SOCKET_PATH)
+    result = None
+    try:
+        sock.sendall((json.dumps(request) + "\n").encode())
+        sock.shutdown(socket.SHUT_WR)
+        with sock.makefile("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"review-bot-review: unparseable event: {line[:200]}", file=sys.stderr)
+                    continue
+                etype = event.get("type")
+                if etype == "log":
+                    print(f"review-bot: {event.get('message', '')}", file=sys.stderr)
+                elif etype == "result":
+                    result = event
+                    break
+                # unknown event types are ignored (forward compatibility)
+    finally:
+        sock.close()
+
+    if result is None:
+        die("the review-bot service closed the connection without a result — check its journal (journalctl -u 'review-bot-review@*')")
+    if not result.get("ok"):
+        die(result.get("error") or "review failed (service reported no error detail)")
+    # Mirror the old CLI's stdout: markdown when --print-only, else the posted URL.
+    if args.print_only:
+        print(result.get("markdown") or "")
+    elif result.get("url"):
+        print(result["url"])
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
