@@ -1,5 +1,13 @@
 #!@PYTHON@
-"""review-bot-review — the reusable PR-review / issue-triage routine (subtask #3 core).
+"""review-bot-review-local — the reusable PR-review / issue-triage routine (subtask #3 core).
+
+This is the IN-PROCESS implementation: running it directly requires local
+credentials (the forge token plus CLAUDE_CONFIG_DIR/CODEX_HOME for the engine
+subprocesses). It is installed two ways:
+  - `review-bot-review-local` — direct CLI, for the service user / debugging;
+  - imported as a module by `review-bot-serve` (the socket-activated service).
+Ordinary callers use `review-bot-review`, which is now a thin CLIENT (client.py)
+speaking to the service over a Unix socket and holding no credentials.
 
 Two modes, sharing all the identity/git/engine/post plumbing:
 
@@ -607,14 +615,18 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
 
 
 def post_or_print(args, token, markdown, kind):
+    """Post (or just print) the final markdown. Returns (markdown, url-or-None) so the
+    serve wrapper (serve.py) can relay both over the protocol; the prints keep the
+    direct CLI behaviour unchanged."""
     if args.print_only:
         print(markdown)
-        return
+        return markdown, None
     num = args.pr if args.mode == "pr" else args.issue
     created = api("POST", f"repos/{args.owner}/{args.repo}/issues/{num}/comments", token, data={"body": markdown})
-    url = created.get("html_url", "(posted; no html_url returned)")
-    log(f"posted {kind} comment: {url}")
-    print(url)
+    url = created.get("html_url") or None
+    log(f"posted {kind} comment: {url or '(no html_url returned)'}")
+    print(url or "(posted; no html_url returned)")
+    return markdown, url
 
 
 def do_pr_review(args, harnesses, bar, focus, token, auth):
@@ -660,7 +672,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
 
     final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "pr")
     markdown = render_markdown(final, harnesses, args.depth, bar, merge_base)
-    post_or_print(args, token, markdown, "review")
+    return post_or_print(args, token, markdown, "review")
 
 
 def do_issue_triage(args, harnesses, bar, focus, token, auth):
@@ -711,7 +723,7 @@ def do_issue_triage(args, harnesses, bar, focus, token, auth):
 
     final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "issue")
     markdown = render_triage_markdown(final, harnesses, args.depth, bar, head_sha)
-    post_or_print(args, token, markdown, "triage")
+    return post_or_print(args, token, markdown, "triage")
 
 
 def main():
