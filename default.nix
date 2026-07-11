@@ -64,4 +64,8 @@ runCommand "review-bot"
     install -Dm755 ${./poll.py} $out/bin/review-bot-poll
     substituteInPlace $out/bin/review-bot-poll \
       --replace-fail '@PYTHON@' ${python3}/bin/python3
+
+    install -Dm755 ${./feedback.py} $out/bin/review-bot-feedback
+    substituteInPlace $out/bin/review-bot-feedback \
+      --replace-fail '@PYTHON@' ${python3}/bin/python3
   ''
