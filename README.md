@@ -13,6 +13,8 @@ uses `fj`.
 - `client.py` → `review-bot-review` — the credential-free client callers use.
 - `poll.py`   → `review-bot-poll`   — scans readable Forgejo repos for
   `@review-bot` mention comments and dispatches the reviewer (via the client).
+- `feedback.py` → `review-bot-feedback` — read-only fetch of review-bot's
+  already-posted feedback for a PR/issue (see *Reading feedback back* below).
 - `*-prompt.md` — the portable review / verify / synthesis / triage prompts.
 - `default.nix` — `callPackage`-able derivation (deps: `python3`, `git`;
   `claude`/`codex` resolved from PATH at runtime).
@@ -72,6 +74,50 @@ Response: NDJSON events on the socket — optional
 Invalid requests still get a `result` event (`ok:false`) and a nonzero exit.
 When stdin is the connection socket, the peer's uid/pid (`SO_PEERCRED`) is
 logged to the journal for audit.
+
+## Reading feedback back
+
+After review-bot comments on a PR (or triages an issue), `review-bot-feedback`
+pulls that feedback back **programmatically** (issue #2). It is a pure READ:
+
+```
+review-bot-feedback --owner O --repo R (--pr N | --issue N) \
+                    [--json|--markdown] [--all] [--kind review,triage,parked]
+```
+
+Unlike `review-bot-review`, it needs **only a forge READ token** — no LLM
+credentials and no engine socket — so it speaks REST directly and ships as its
+own bin. It is **never** routed through `review-bot-serve` (that would make a
+cheap read block behind the service's `MaxConnections=1` engine slot). It is
+strictly read-only: it never posts, labels, or closes.
+
+- `--pr N` / `--issue N` — the target; PR and issue comments share the same
+  endpoint, so one path serves both. Give exactly one.
+- A comment counts as review-bot's iff its author login is in the handle set
+  (default `review-bot`, `review_bot`; override via `REVIEW_BOT_HANDLES`, same
+  as the poller). Each matched comment is classified by its footer marker into
+  a `kind`: `review`, `triage`, `parked`, or `other`.
+- `--json` (default) emits an envelope:
+
+  ```json
+  {
+    "repo": "owner/repo", "number": 70, "target": "pr",
+    "latest": {"id":123, "html_url":"…", "created_at":"…",
+               "author":"review-bot", "kind":"review", "body_markdown":"…"},
+    "all": [ … ]
+  }
+  ```
+
+  `"all"` (newest-first) is present only with `--all`.
+- `--markdown` prints just the latest matched comment's markdown body.
+- `--kind review,triage` filters to those classifications (default: all kinds).
+- "Latest" is the most recent matched comment by `created_at` (id as a
+  tiebreak). If review-bot has never commented on the thread (after any
+  `--kind` filter), it prints a message to stderr and **exits non-zero**.
+
+Token source, in order: `FORGEJO_TOKEN` env → `REVIEW_BOT_TOKEN_FILE` / the
+standard token-file candidates → else an error with guidance. Any token that
+can read the repo works.
 
 ## Status
 
