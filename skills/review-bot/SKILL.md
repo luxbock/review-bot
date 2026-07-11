@@ -11,13 +11,20 @@ routine: olli tells the VPA "have review-bot review PR N" (or "triage issue N") 
 run the packaged `review-bot-review` program. The **same** program is what the scheduled
 `@review-bot` mention poller calls — this skill just adds the human/VPA/agent entry point.
 
-review-bot has **two modes**, both posting exactly ONE comment as the read-only identity:
-- **`--mode pr`** (default) — reviews a PR diff and posts severity-banded findings.
-- **`--mode issue`** — triages a filed issue: reads the issue thread + the repo's code and
-  convention docs, then classifies it into one disposition (works-as-designed · docs-gap ·
-  genuine-bug · enhancement · wrong-repo · needs-info) with a grounded, cited assessment and
-  the single most fruitful next step. Purpose: bridge an out-of-context complaint (often
+review-bot has **three modes**, each producing exactly ONE artifact as the read-only identity:
+- **`--mode pr`** (default) — reviews a PR diff and **posts one comment** with severity-banded findings.
+- **`--mode issue`** — triages a filed issue and **posts one comment**: reads the issue thread +
+  the repo's code and convention docs, then classifies it into one disposition (works-as-designed ·
+  docs-gap · genuine-bug · enhancement · wrong-repo · needs-info) with a grounded, cited assessment
+  and the single most fruitful next step. Purpose: bridge an out-of-context complaint (often
   filed by an agent USING the tool from the outside) into an in-context disposition.
+- **`--mode repo`** — a whole-repo maintainability audit that **files one prioritized issue**
+  (not a comment): it runs the engine over the default-branch tip, lets it explore the tree, and
+  files up to ~15 severity-ranked findings as a single issue titled
+  `review-bot audit: <owner>/<repo> maintainability findings` — feeding the same issue-driven fix
+  pipeline as a bug report. It is **numberless** (no `--pr`/`--issue`; a stray one is rejected) and
+  files **no labels**. If a prior open audit issue exists (matched by title prefix) the new one
+  links it as `Supersedes #N` but never closes it — olli decides.
 
 review-bot is a **deliberately separate identity from aatos**: aatos *authors* PRs,
 review-bot *reviews* them (a genuine second party, not self-review). It is **read-only**
@@ -54,11 +61,16 @@ review-bot-review --owner <owner> --repo <repo> --pr <n> \
 # Triage an issue
 review-bot-review --mode issue --owner <owner> --repo <repo> --issue <n> \
   [--harness …] [--depth …] [--focus …] [--confidence-bar …] [--print-only]
+
+# Audit a whole repo (numberless — files one issue)
+review-bot-review --mode repo --owner <owner> --repo <repo> \
+  [--harness …] [--depth …] [--focus …] [--confidence-bar …] [--dry-run] [--print-only]
 ```
 
-`--mode` defaults to `pr`; passing `--issue N` (without `--pr`) infers `--mode issue`. In
-issue mode there is no diff — the routine checks out the repo's default-branch tip and the
-triager assesses the report against how the code actually works.
+`--mode` defaults to `pr`; passing `--issue N` (without `--pr`) infers `--mode issue`. `--mode
+repo` (alias `--scope repo`) is numberless — pass neither `--pr` nor `--issue`. In
+issue and repo modes there is no diff — the routine checks out the repo's default-branch tip;
+issue mode assesses the report against how the code actually works, repo mode audits the tree.
 
 `--repo-dir` is **not supported**: reviews run in the service's own clone cache, which
 cannot see your local checkouts. Requests **serialize** — the service runs one review at
@@ -73,9 +85,9 @@ stdout **without posting anything** to the forge — a pure consult. Drop `--pri
 you do want the verdict left on the PR/issue for others. Either way it runs as the
 review-bot identity (its own token), which is correct regardless of who invoked it.
 
-- On success it prints the posted comment's URL (and logs to stderr). Empty findings ⇒
-  a short "no blocking issues" comment — **silence is a correct, good outcome**; do not
-  re-run hunting for problems.
+- On success it prints the posted comment's URL — or, in `--mode repo`, the filed issue's
+  URL (and logs to stderr). Empty findings ⇒ a short "no blocking issues" comment —
+  **silence is a correct, good outcome**; do not re-run hunting for problems.
 - **`--dry-run` first** when unsure: it prints the exact engine command + filled
   prompt(s) and posts nothing. Use it to sanity-check before a live run.
 - **`--print-only`** runs the engines but prints the Markdown instead of posting — handy
@@ -107,6 +119,8 @@ When olli phrases it naturally, translate to flags (defaults when unstated):
   `--mode issue --issue 7 --repo org-gtd-cli --depth standard`
 - "triage issue 7, is it a real bug or a misunderstanding?" →
   `--mode issue --issue 7 --focus "is it a real bug or a misunderstanding?"`
+- "have review-bot audit the org-gtd-cli repo" (or "do a maintainability pass on X") →
+  `--mode repo --repo org-gtd-cli` (numberless — files one prioritized issue)
 
 Resolve `<owner>/<repo>` from context (the PR/issue's repo). For nixos-config that is
 `olli/nixos-config`; for others, ask or infer from the clone olli is pointing at.
