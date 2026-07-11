@@ -40,6 +40,7 @@ import base64
 import contextlib
 import fcntl
 import json
+import uuid
 import os
 import re
 import shlex
@@ -233,9 +234,16 @@ def ensure_clone(owner, repo, auth, repo_dir=None):
         return cdir
     os.makedirs(CACHE_ROOT, exist_ok=True)
     cdir = os.path.join(CACHE_ROOT, f"{owner}__{repo}")
-    if not os.path.isdir(os.path.join(cdir, ".git")):
-        log(f"cloning {owner}/{repo} into cache {cdir}")
-        git(["clone", "--quiet", f"{FORGE_URL}/{owner}/{repo}.git", cdir], cwd=CACHE_ROOT, auth=auth)
+    if os.path.isdir(os.path.join(cdir, ".git")):
+        return cdir
+    # Clone-if-missing under the sibling repo lock, with double-checked locking so two
+    # concurrent first-ever runs don't collide on `git clone` into the same dir: the
+    # loser re-checks inside the lock and skips. The lock is a SIBLING file (not inside
+    # cdir) so it can be held while cdir is still empty — git clone needs an empty target.
+    with _shared_store_lock(_repo_lock_path(owner, repo)):
+        if not os.path.isdir(os.path.join(cdir, ".git")):
+            log(f"cloning {owner}/{repo} into cache {cdir}")
+            git(["clone", "--quiet", f"{FORGE_URL}/{owner}/{repo}.git", cdir], cwd=CACHE_ROOT, auth=auth)
     return cdir
 
 
@@ -245,9 +253,16 @@ def ensure_clone(owner, repo, auth, repo_dir=None):
 # The engine explores that private tree (cwd=worktree) for the whole run, unlocked.
 def _new_runid():
     """A per-invocation id that is unique even for two runs on the SAME PR: pid plus a
-    mkdtemp-style random suffix. We only use it to name a dir/ref, not as the dir itself."""
-    suffix = next(tempfile._get_candidate_names())  # noqa: SLF001 — stdlib random-name source
-    return f"{os.getpid()}-{suffix}"
+    random uuid suffix. We only use it to name a dir/ref, not as the dir itself."""
+    return f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _repo_lock_path(owner, repo):
+    """Sibling lock file for a repo's shared store. It lives BESIDE the clone dir (not
+    inside it), because the clone-if-missing guard needs to hold the lock while the
+    target dir is still empty — a lock file inside cdir would block `git clone`, which
+    requires an empty destination."""
+    return os.path.join(CACHE_ROOT, f"{owner}__{repo}.lock")
 
 
 def _wt_root(cdir):
@@ -272,12 +287,12 @@ def sweep_stale_worktrees(cdir, auth):
 
 
 @contextlib.contextmanager
-def _shared_store_lock(cdir):
-    """Hold an exclusive flock around ref-updating git commands (fetch + worktree add)
-    into the shared store, so concurrent runs serialise their writes to it. Released as
-    soon as the private worktree exists — the (minutes-long) engine run is NOT held."""
-    os.makedirs(cdir, exist_ok=True)
-    lock_path = os.path.join(cdir, ".git.lock")
+def _shared_store_lock(lock_path):
+    """Hold an exclusive flock on `lock_path` around ALL writes to a repo's shared store —
+    the clone-if-missing guard AND the fetch + worktree-add critical section — so
+    concurrent runs serialise on ONE per-repo sibling lock. Released as soon as the
+    private worktree exists; the (minutes-long) engine run is NOT held."""
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -354,7 +369,7 @@ def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None):
     pr_ref = f"refs/review-bot/wt-{runid}/pr-{pr}"
     log(f"fetching base {base_ref} + PR #{pr} head (run {runid})")
     sweep_stale_worktrees(cdir, auth)
-    with _shared_store_lock(cdir):
+    with _shared_store_lock(_repo_lock_path(owner, repo)):
         git(["fetch", "--quiet", "origin", f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"], cwd=cdir, auth=auth)
         git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{pr_ref}"], cwd=cdir, auth=auth)
         mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", pr_ref], cwd=cdir, auth=auth)
@@ -400,7 +415,7 @@ def prepare_head_checkout(owner, repo, default_branch, auth, repo_dir=None):
     branch_ref = f"refs/review-bot/wt-{runid}/{default_branch}"
     log(f"fetching {default_branch} tip for triage (run {runid})")
     sweep_stale_worktrees(cdir, auth)
-    with _shared_store_lock(cdir):
+    with _shared_store_lock(_repo_lock_path(owner, repo)):
         git(
             ["fetch", "--quiet", "origin", f"+refs/heads/{default_branch}:{branch_ref}"],
             cwd=cdir,

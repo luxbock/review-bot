@@ -102,9 +102,9 @@ class CheckoutIsolationTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_concurrent_prs_are_isolated(self):
-        # Warm the shared clone first. The shared-store lock deliberately covers only the
-        # fetch + worktree-add ref updates (not the one-time initial clone), matching the
-        # real deployment where the repo cache is already present before concurrent runs.
+        # Warm the shared clone first, so this case exercises the fetch + worktree-add
+        # path against an already-present cache (the common steady-state). The separate
+        # test_concurrent_first_clone_is_serialized case covers the cold-cache race.
         self.review.ensure_clone(self.owner, self.repo, self.auth, None)
 
         results = {}
@@ -163,6 +163,71 @@ class CheckoutIsolationTest(unittest.TestCase):
         # git's own worktree list should be back to just the main clone.
         listing = self.review.git(["worktree", "list", "--porcelain"], cwd=cdir, auth=self.auth).stdout
         self.assertEqual(listing.count("worktree "), 1, f"stray worktrees registered:\n{listing}")
+
+    def test_concurrent_first_clone_is_serialized(self):
+        # COLD cache: no pre-warm. Two concurrent first-ever runs must NOT collide on
+        # `git clone` into the same dir — the sibling-lock guard + double-checked locking
+        # means exactly one clone happens and both runs still get a correct worktree.
+        self.assertFalse(
+            os.path.exists(os.path.join(self.review.CACHE_ROOT, f"{self.owner}__{self.repo}")),
+            "cache must be cold at the start of this test",
+        )
+
+        # Count how many times `git clone` actually runs, by wrapping review.git.
+        real_git = self.review.git
+        clone_lock = threading.Lock()
+        clone_count = {"n": 0}
+
+        def counting_git(args, *a, **kw):
+            if args and args[0] == "clone":
+                with clone_lock:
+                    clone_count["n"] += 1
+            return real_git(args, *a, **kw)
+
+        self.review.git = counting_git
+        try:
+            results = {}
+            errors = {}
+            barrier = threading.Barrier(2)
+
+            def worker(pr):
+                try:
+                    barrier.wait()  # both hit the cold cache together
+                    checkout, merge_base = self.review.prepare_checkout(
+                        self.owner, self.repo, pr, "main", self.auth, None
+                    )
+                    diff = self.review.git(
+                        ["diff", "--name-only", f"{merge_base}..HEAD"], cwd=checkout.wt, auth=self.auth
+                    ).stdout.strip()
+                    results[pr] = {"wt": checkout.wt, "diff": diff}
+                    checkout.__exit__(None, None, None)
+                except BaseException as e:  # noqa: BLE001
+                    errors[pr] = e
+
+            threads = [threading.Thread(target=worker, args=(pr,)) for pr in (1, 2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            self.review.git = real_git
+
+        self.assertEqual(errors, {}, f"worker(s) raised: {errors}")
+        self.assertEqual(
+            clone_count["n"], 1, f"expected exactly one clone, got {clone_count['n']}"
+        )
+        for pr in (1, 2):
+            files = [ln for ln in results[pr]["diff"].splitlines() if ln]
+            self.assertEqual(
+                files,
+                [self.expected_file[pr]],
+                f"PR {pr} worktree diff was {files}, expected [{self.expected_file[pr]}]",
+            )
+        self.assertNotEqual(results[1]["wt"], results[2]["wt"])
+        cdir = os.path.join(self.review.CACHE_ROOT, f"{self.owner}__{self.repo}")
+        wt_root = os.path.join(cdir, ".wt")
+        leftover = os.listdir(wt_root) if os.path.isdir(wt_root) else []
+        self.assertEqual(leftover, [], f".wt/ accumulated leftovers: {leftover}")
 
     def test_issue_head_checkout_isolated_and_cleaned(self):
         checkout, head = self.review.prepare_head_checkout(
