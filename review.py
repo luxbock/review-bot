@@ -309,11 +309,23 @@ def _worktree_is_stale(name, path, now):
     return not _pid_is_alive(pid)
 
 
+def _prune_run_refs(cdir, runid, auth):
+    """Delete any per-run namespaced refs (refs/review-bot/wt-<runid>/*) belonging to a
+    reaped run. On a graceful exit Checkout.__exit__ deletes the run's ref; on a hard kill
+    (SIGKILL/OOM/power loss) __exit__ never runs, so without this the sweep would reap the
+    dead worktree DIR but leak its ref, pinning the fetched objects against GC forever."""
+    prefix = f"refs/review-bot/wt-{runid}/"
+    proc = git(["for-each-ref", "--format=%(refname)", prefix], cwd=cdir, auth=auth, check=False)
+    for ref in (proc.stdout or "").split():
+        with contextlib.suppress(Exception):
+            git(["update-ref", "-d", ref], cwd=cdir, auth=auth, check=False)
+
+
 def sweep_stale_worktrees(cdir, auth):
     """Best-effort crash cleanup: drop ONLY leftover .wt/* dirs whose owning run is gone
-    (dead owner pid, or older than WT_STALE_SECS), then let git forget them. Worktrees
-    owned by a still-live concurrent run are LEFT ALONE — force-removing them would
-    destroy that run's checkout mid-review. Never fatal — this is hygiene."""
+    (dead owner pid, or older than WT_STALE_SECS), plus their orphaned per-run refs, then
+    let git forget them. Worktrees owned by a still-live concurrent run are LEFT ALONE —
+    force-removing them would destroy that run's checkout mid-review. Never fatal — hygiene."""
     import time as _time
 
     root = _wt_root(cdir)
@@ -327,6 +339,8 @@ def sweep_stale_worktrees(cdir, auth):
                 git(["worktree", "remove", "--force", path], cwd=cdir, auth=auth, check=False)
                 if os.path.exists(path):
                     shutil.rmtree(path, ignore_errors=True)
+                # The dir's name IS the runid; reap its per-run refs too (crash asymmetry).
+                _prune_run_refs(cdir, name, auth)
             except Exception:
                 pass
     with contextlib.suppress(Exception):

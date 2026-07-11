@@ -256,6 +256,19 @@ class CheckoutIsolationTest(unittest.TestCase):
         dead_runid = f"{dead_pid}-{uuid.uuid4().hex[:8]}"
         dead_wt = self.review.add_worktree(cdir, dead_runid, "refs/rb-test/main", self.auth)
 
+        # Per-run namespaced refs, as a real run creates them. On a graceful exit
+        # Checkout.__exit__ deletes its ref; a crashed run leaks one, and the sweep must
+        # reap it alongside the dead dir (issue #1 review follow-up).
+        live_ref = f"refs/review-bot/wt-{live_runid}/main"
+        dead_ref = f"refs/review-bot/wt-{dead_runid}/main"
+        for ref in (live_ref, dead_ref):
+            self.review.git(["update-ref", ref, "refs/rb-test/main"], cwd=cdir, auth=self.auth)
+
+        def ref_exists(ref):
+            return self.review.git(
+                ["show-ref", "--verify", "--quiet", ref], cwd=cdir, auth=self.auth, check=False
+            ).returncode == 0
+
         self.assertTrue(os.path.isdir(live_wt))
         self.assertTrue(os.path.isdir(dead_wt))
 
@@ -267,6 +280,14 @@ class CheckoutIsolationTest(unittest.TestCase):
         )
         self.assertFalse(
             os.path.exists(dead_wt), "sweep failed to reap a dead-owner (crashed) worktree"
+        )
+        # And its orphaned per-run ref must be reaped too (else it pins objects vs GC);
+        # the live run's ref must be left intact.
+        self.assertFalse(
+            ref_exists(dead_ref), "sweep left a crashed run's per-run ref (leaks objects against GC)"
+        )
+        self.assertTrue(
+            ref_exists(live_ref), "sweep deleted a live concurrent run's per-run ref"
         )
 
         # And the age guard: even a live owner does not protect a truly-ancient tree.
