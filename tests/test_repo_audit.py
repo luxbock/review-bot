@@ -199,7 +199,7 @@ def test_print_only_renders_no_post():
 
 def test_create_issue_path():
     """3. Create-issue path: verify the tool POSTs to .../issues (create issue) with the
-    title/labels convention and rendered body — NOT to .../issues/{n}/comments."""
+    title convention and rendered body (no labels) — NOT to .../issues/{n}/comments."""
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["REVIEW_BOT_CLAUDE_CMD"] = sys.executable + " " + make_stub_engine(tmp, CANNED_AUDIT)
         review = fresh_review()
@@ -231,14 +231,16 @@ def test_create_issue_path():
         assert path == "repos/acme/widget/issues", f"must POST to create-issue, not: {path}"
         assert not path.endswith("/comments"), "must NOT post to the comments endpoint"
         assert data["title"] == "review-bot audit: acme/widget maintainability findings", data["title"]
-        assert data["labels"] == ["audit", "review-bot"], data.get("labels")
+        assert "labels" not in data, "create POST must NOT carry a labels field (review-bot never labels)"
         assert data["body"] == markdown, "posted body must be the rendered markdown"
         assert data["body"].startswith("## 🤖 review-bot audit"), data["body"][:80]
-    print("ok  3. create-issue POSTs to /issues with title+labels+body, not /comments")
+    print("ok  3. create-issue POSTs to /issues with title+body (no labels), not /comments")
 
 
-def test_create_issue_label_fallback_and_supersede():
-    """3b. If create-with-labels fails, retry label-free; and a prior audit issue is linked."""
+def test_create_issue_supersede_no_labels():
+    """3b. A prior open audit issue (matched by title prefix) is linked as `Supersedes #N` in
+    the new body, and the create POST carries {title, body} with NO labels field (review-bot
+    is read-only and never touches the labels API)."""
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["REVIEW_BOT_CLAUDE_CMD"] = sys.executable + " " + make_stub_engine(tmp, CANNED_AUDIT)
         review = fresh_review()
@@ -249,11 +251,9 @@ def test_create_issue_label_fallback_and_supersede():
             if method == "GET" and path == "repos/acme/widget":
                 return {"default_branch": "main"}
             if method == "GET" and path.startswith("repos/acme/widget/issues?"):
-                # one existing open audit issue (matched by title prefix)
-                return [{"number": 7, "title": "review-bot audit: acme/widget maintainability findings", "labels": []}]
+                # one existing open audit issue, matched purely by the title prefix
+                return [{"number": 7, "title": "review-bot audit: acme/widget maintainability findings"}]
             if method == "POST" and path == "repos/acme/widget/issues":
-                if data.get("labels"):
-                    review.die("label 'audit' does not exist")  # simulate forge rejecting labels
                 return {"html_url": "http://forge/acme/widget/issues/43", "number": 43}
             raise AssertionError(f"unexpected api call: {method} {path}")
 
@@ -267,11 +267,13 @@ def test_create_issue_label_fallback_and_supersede():
 
         assert url == "http://forge/acme/widget/issues/43", url
         posts = [c for c in calls if c[0] == "POST"]
-        assert len(posts) == 2, f"expected a labeled POST then a label-free retry, got {posts}"
-        assert posts[0][2].get("labels") == ["audit", "review-bot"]
-        assert "labels" not in posts[1][2], "retry must drop labels"
+        assert len(posts) == 1, f"expected exactly one POST (no label retry), got {posts}"
+        _, path, data = posts[0]
+        assert path == "repos/acme/widget/issues", path
+        assert set(data.keys()) == {"title", "body"}, f"POST must carry only title+body: {sorted(data)}"
+        assert "labels" not in data, "create POST must NOT carry a labels field"
         assert "Supersedes #7" in markdown, "prior audit issue must be linked"
-    print("ok  3b. label failure falls back to label-free; prior audit issue linked (Supersedes)")
+    print("ok  3b. prior audit issue linked (Supersedes) by title prefix; POST has no labels")
 
 
 def test_serve_parse_request_repo_numberless():
@@ -316,7 +318,7 @@ def main():
         test_dry_run_emits_prompt_runs_nothing,
         test_print_only_renders_no_post,
         test_create_issue_path,
-        test_create_issue_label_fallback_and_supersede,
+        test_create_issue_supersede_no_labels,
         test_serve_parse_request_repo_numberless,
     ]
     for t in tests:

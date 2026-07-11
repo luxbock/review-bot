@@ -14,12 +14,12 @@ Three modes, sharing all the identity/git/engine/post plumbing:
 - `--mode repo` — runs a whole-repository maintainability pass (categories:
   duplication, dead code, layering drift, test-coverage-gap hotspots) and
   **creates one prioritized issue** (title `review-bot audit: <owner>/<repo>
-  maintainability findings`, labels `audit,review-bot`) whose body is a ranked
-  finding list. Takes **no** `--pr`/`--issue` number (`--scope repo` is an
-  alias). It POSTs to the create-issue endpoint (not comments), feeding the same
-  issue-driven fix pipeline. If label creation fails (labels absent on the repo)
-  it retries label-free; if a prior open audit issue exists it links it
-  (`Supersedes #N`) rather than closing it.
+  maintainability findings`) whose body is a ranked finding list. Takes **no**
+  `--pr`/`--issue` number (`--scope repo` is an alias). It POSTs `{title, body}`
+  to the create-issue endpoint (not comments), feeding the same issue-driven fix
+  pipeline. Consistent with review-bot's read-only charter it applies **no
+  labels** (it never touches the labels API); if a prior open audit issue exists
+  it links it (`Supersedes #N`) rather than closing it.
 
 - `review.py` → `review-bot-review-local` — the in-process reviewer/triager
   (engine-agnostic); also the module `review-bot-serve` imports.

@@ -714,25 +714,18 @@ def post_or_print(args, token, markdown, kind):
 
 
 AUDIT_TITLE_PREFIX = "review-bot audit:"
-AUDIT_LABELS = ["audit", "review-bot"]
 
 
 def find_existing_audit_issue(owner, repo, token):
     """GET open issues; return the number of a prior audit issue (matched by the title
-    prefix or the audit label) so the new body can link it, else None. Best-effort — never
-    fails the audit."""
-    try:
-        issues = api_paged(f"repos/{owner}/{repo}/issues?state=open&type=issues", token)
-    except SystemExit:
-        raise
-    except Exception:
-        return None
+    prefix) so the new body can link it, else None. review-bot never applies labels, so
+    matching is by title only."""
+    issues = api_paged(f"repos/{owner}/{repo}/issues?state=open&type=issues", token)
     for it in issues:
         if it.get("pull_request"):
             continue
         title = (it.get("title") or "").strip()
-        labels = {lb.get("name", "") for lb in (it.get("labels") or [])}
-        if title.startswith(AUDIT_TITLE_PREFIX) or (set(AUDIT_LABELS) & labels):
+        if title.startswith(AUDIT_TITLE_PREFIX):
             num = it.get("number")
             if isinstance(num, int):
                 return num
@@ -741,21 +734,15 @@ def find_existing_audit_issue(owner, repo, token):
 
 def post_or_create_issue(args, token, title, markdown, kind):
     """CREATE an issue (NOT a comment) with the rendered audit body. Returns (markdown, url).
-    Honours --print-only (render, don't POST). Tries with the audit labels first; if label
-    creation/attachment fails (labels may not exist on the repo), retries WITHOUT labels
-    rather than failing the whole audit."""
+    Honours --print-only (render, don't POST). POSTs {title, body} only — review-bot is
+    READ-ONLY and never touches the labels API (and Forgejo's labels field takes label IDs,
+    not names, so name-based labels can't work anyway). A genuine POST failure surfaces via
+    api()'s die(), like everywhere else."""
     if args.print_only:
         print(markdown)
         return markdown, None
     path = f"repos/{args.owner}/{args.repo}/issues"
-    try:
-        created = api("POST", path, token, data={"title": title, "body": markdown, "labels": AUDIT_LABELS})
-    except (SystemExit, Exception):
-        # api() dies on HTTP error (e.g. labels don't exist on the repo). die() is
-        # sys.exit under the CLI but monkeypatched to raise under serve.py, so catch both
-        # — retry label-free rather than failing the whole audit.
-        log("create-issue with labels failed; retrying without labels")
-        created = api("POST", path, token, data={"title": title, "body": markdown})
+    created = api("POST", path, token, data={"title": title, "body": markdown})
     url = created.get("html_url") or None
     log(f"created {kind} issue: {url or '(no html_url returned)'}")
     print(url or "(created; no html_url returned)")
