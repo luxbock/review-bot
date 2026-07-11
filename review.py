@@ -37,10 +37,13 @@ call THIS program — it is the single reusable unit.
 
 import argparse
 import base64
+import contextlib
+import fcntl
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -214,7 +217,15 @@ def git(args, cwd, auth, check=True, capture=True):
 
 
 def ensure_clone(owner, repo, auth, repo_dir=None):
-    """Return a git working dir for owner/repo — an existing --repo-dir or a cache clone."""
+    """Return a git working dir for owner/repo — an existing --repo-dir or a cache clone.
+
+    The returned cache clone is the SHARED object store + fetch target for a repo; it is
+    never itself checked out at a PR head anymore. Per-run isolated worktrees (see
+    add_worktree) are carved out of it. When --repo-dir is given we return the caller's
+    dir untouched and unmanaged: concurrent --repo-dir runs on the SAME dir race each
+    other's working tree, and keeping them safe is the caller's responsibility (this
+    escape hatch is for a human debugging against a checkout they control).
+    """
     if repo_dir:
         cdir = os.path.abspath(repo_dir)
         if not os.path.isdir(os.path.join(cdir, ".git")):
@@ -228,17 +239,130 @@ def ensure_clone(owner, repo, auth, repo_dir=None):
     return cdir
 
 
-def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None):
-    """Clone/fetch into a cache dir, fetch the PR head + base, return (dir, merge_base)."""
-    cdir = ensure_clone(owner, repo, auth, repo_dir)
-    log(f"fetching base {base_ref} + PR #{pr} head")
-    git(["fetch", "--quiet", "origin", f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"], cwd=cdir, auth=auth)
-    git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
+# ── per-run worktree isolation (issue #1) ──────────────────────────────────────
+# Every run gets its OWN detached worktree carved out of the shared cache clone, so
+# two concurrent runs against the same repo never race a single shared working tree.
+# The engine explores that private tree (cwd=worktree) for the whole run, unlocked.
+def _new_runid():
+    """A per-invocation id that is unique even for two runs on the SAME PR: pid plus a
+    mkdtemp-style random suffix. We only use it to name a dir/ref, not as the dir itself."""
+    suffix = next(tempfile._get_candidate_names())  # noqa: SLF001 — stdlib random-name source
+    return f"{os.getpid()}-{suffix}"
 
-    mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", f"refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
-    merge_base = mb.stdout.strip()
-    git(["checkout", "--quiet", "--detach", f"refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
-    return cdir, merge_base
+
+def _wt_root(cdir):
+    return os.path.join(cdir, ".wt")
+
+
+def sweep_stale_worktrees(cdir, auth):
+    """Best-effort crash cleanup: drop leftover .wt/* dirs from runs that died before
+    their finally-block ran, then let git forget them. Never fatal — this is hygiene."""
+    root = _wt_root(cdir)
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            try:
+                git(["worktree", "remove", "--force", path], cwd=cdir, auth=auth, check=False)
+                if os.path.exists(path):
+                    shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+    with contextlib.suppress(Exception):
+        git(["worktree", "prune"], cwd=cdir, auth=auth, check=False)
+
+
+@contextlib.contextmanager
+def _shared_store_lock(cdir):
+    """Hold an exclusive flock around ref-updating git commands (fetch + worktree add)
+    into the shared store, so concurrent runs serialise their writes to it. Released as
+    soon as the private worktree exists — the (minutes-long) engine run is NOT held."""
+    os.makedirs(cdir, exist_ok=True)
+    lock_path = os.path.join(cdir, ".git.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def add_worktree(cdir, runid, ref, auth):
+    """Create a private detached worktree at cdir/.wt/<runid> checked out at `ref`."""
+    root = _wt_root(cdir)
+    os.makedirs(root, exist_ok=True)
+    wt = os.path.join(root, runid)
+    git(["worktree", "add", "--quiet", "--detach", wt, ref], cwd=cdir, auth=auth)
+    return wt
+
+
+def remove_worktree(cdir, wt, auth):
+    """Tear down a private worktree (safe to call even if it's already gone)."""
+    if not wt:
+        return
+    with contextlib.suppress(Exception):
+        git(["worktree", "remove", "--force", wt], cwd=cdir, auth=auth, check=False)
+    if os.path.isdir(wt):
+        shutil.rmtree(wt, ignore_errors=True)
+    with contextlib.suppress(Exception):
+        git(["worktree", "prune"], cwd=cdir, auth=auth, check=False)
+
+
+class Checkout:
+    """A private per-run worktree plus the data the caller needs. Used as a context
+    manager so the worktree is ALWAYS removed — on normal return, on die() (sys.exit in
+    the CLI path) and on the ReviewFailure exception the serve path rebinds die() to."""
+
+    def __init__(self, cdir, wt, ref):
+        self.cdir = cdir  # shared cache clone (object store)
+        self.wt = wt  # private worktree — the engine's cwd
+        self.ref = ref  # the per-run namespaced ref we fetched into (or None)
+        self.auth = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # cdir is None for the unmanaged --repo-dir path: nothing to remove.
+        if self.wt and self.cdir and self.wt != self.cdir:
+            remove_worktree(self.cdir, self.wt, self.auth)
+        if self.ref and self.cdir:
+            with contextlib.suppress(Exception):
+                git(["update-ref", "-d", self.ref], cwd=self.cdir, auth=self.auth, check=False)
+        return False
+
+
+def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None):
+    """Fetch the PR head + base into the shared cache, carve a PRIVATE detached worktree
+    at the PR head, and return (Checkout, merge_base). The returned Checkout MUST be used
+    as a context manager (or have __exit__ called) so its worktree is cleaned up."""
+    cdir = ensure_clone(owner, repo, auth, repo_dir)
+    if repo_dir:
+        # --repo-dir is the caller's own checkout: keep the legacy in-place behaviour
+        # (no private worktree, no cleanup). Concurrency here is the caller's problem.
+        git(["fetch", "--quiet", "origin", f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"], cwd=cdir, auth=auth)
+        git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
+        mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", f"refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
+        merge_base = mb.stdout.strip()
+        git(["checkout", "--quiet", "--detach", f"refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
+        co = Checkout(None, cdir, None)
+        co.auth = auth
+        return co, merge_base
+
+    runid = _new_runid()
+    pr_ref = f"refs/review-bot/wt-{runid}/pr-{pr}"
+    log(f"fetching base {base_ref} + PR #{pr} head (run {runid})")
+    sweep_stale_worktrees(cdir, auth)
+    with _shared_store_lock(cdir):
+        git(["fetch", "--quiet", "origin", f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"], cwd=cdir, auth=auth)
+        git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{pr_ref}"], cwd=cdir, auth=auth)
+        mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", pr_ref], cwd=cdir, auth=auth)
+        merge_base = mb.stdout.strip()
+        wt = add_worktree(cdir, runid, pr_ref, auth)
+    co = Checkout(cdir, wt, pr_ref)
+    co.auth = auth
+    return co, merge_base
 
 
 def changed_files_block(cdir, merge_base, auth):
@@ -256,17 +380,37 @@ def changed_files_block(cdir, merge_base, auth):
 
 # ── issue-triage input (mode=issue) ────────────────────────────────────────────
 def prepare_head_checkout(owner, repo, default_branch, auth, repo_dir=None):
-    """Check out the tip of the default branch (issue triage reads code, not a diff)."""
+    """Check out the tip of the default branch (issue triage reads code, not a diff) into
+    a PRIVATE per-run worktree. Returns (Checkout, head_sha); use the Checkout as a
+    context manager so its worktree is cleaned up."""
     cdir = ensure_clone(owner, repo, auth, repo_dir)
-    log(f"fetching {default_branch} tip for triage")
-    git(
-        ["fetch", "--quiet", "origin", f"+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}"],
-        cwd=cdir,
-        auth=auth,
-    )
-    git(["checkout", "--quiet", "--detach", f"refs/remotes/origin/{default_branch}"], cwd=cdir, auth=auth)
-    head = git(["rev-parse", "HEAD"], cwd=cdir, auth=auth).stdout.strip()
-    return cdir, head
+    if repo_dir:
+        git(
+            ["fetch", "--quiet", "origin", f"+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}"],
+            cwd=cdir,
+            auth=auth,
+        )
+        git(["checkout", "--quiet", "--detach", f"refs/remotes/origin/{default_branch}"], cwd=cdir, auth=auth)
+        head = git(["rev-parse", "HEAD"], cwd=cdir, auth=auth).stdout.strip()
+        co = Checkout(None, cdir, None)
+        co.auth = auth
+        return co, head
+
+    runid = _new_runid()
+    branch_ref = f"refs/review-bot/wt-{runid}/{default_branch}"
+    log(f"fetching {default_branch} tip for triage (run {runid})")
+    sweep_stale_worktrees(cdir, auth)
+    with _shared_store_lock(cdir):
+        git(
+            ["fetch", "--quiet", "origin", f"+refs/heads/{default_branch}:{branch_ref}"],
+            cwd=cdir,
+            auth=auth,
+        )
+        wt = add_worktree(cdir, runid, branch_ref, auth)
+    head = git(["rev-parse", "HEAD"], cwd=wt, auth=auth).stdout.strip()
+    co = Checkout(cdir, wt, branch_ref)
+    co.auth = auth
+    return co, head
 
 
 def issue_context_block(issue, comments):
@@ -634,45 +778,46 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     if meta.get("merged"):
         log("note: PR is already merged — reviewing anyway")
     base_ref = meta["base"]["ref"]
-    cdir, merge_base = prepare_checkout(args.owner, args.repo, args.pr, base_ref, auth, args.repo_dir or None)
+    checkout, merge_base = prepare_checkout(args.owner, args.repo, args.pr, base_ref, auth, args.repo_dir or None)
+    with checkout:
+        cdir = checkout.wt  # the private per-run worktree — the engine's cwd
+        diff_block = changed_files_block(cdir, merge_base, auth)
+        conv = convention_files(cdir)
+        conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
 
-    diff_block = changed_files_block(cdir, merge_base, auth)
-    conv = convention_files(cdir)
-    conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
-
-    gen_prompt = fill(
-        REVIEW_PROMPT_FILE,
-        {
-            "MERGE_BASE": merge_base[:12],
-            "DIFF_OR_FILE_LIST": diff_block,
-            "CONVENTION_FILES": conv_str,
-            "FOCUS": focus,
-            "CONFIDENCE_BAR": bar,
-        },
-    )
-    verify_fill = None
-    if args.depth != "quick":
-        verify_fill = lambda r: fill(  # noqa: E731
-            VERIFY_PROMPT_FILE,
-            {"MERGE_BASE": merge_base[:12], "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+        gen_prompt = fill(
+            REVIEW_PROMPT_FILE,
+            {
+                "MERGE_BASE": merge_base[:12],
+                "DIFF_OR_FILE_LIST": diff_block,
+                "CONVENTION_FILES": conv_str,
+                "FOCUS": focus,
+                "CONFIDENCE_BAR": bar,
+            },
         )
-    synth_fill = lambda rs: fill(  # noqa: E731
-        SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
-    )
+        verify_fill = None
+        if args.depth != "quick":
+            verify_fill = lambda r: fill(  # noqa: E731
+                VERIFY_PROMPT_FILE,
+                {"MERGE_BASE": merge_base[:12], "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+            )
+        synth_fill = lambda rs: fill(  # noqa: E731
+            SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
+        )
 
-    if args.dry_run:
-        for h in harnesses:
-            run_engine(h, gen_prompt, cdir, dry_run=True)
-        if verify_fill:
-            run_engine(harnesses[0], verify_fill({"<the>": "<generated review JSON>"}), cdir, dry_run=True)
-        if len(harnesses) > 1:
-            run_engine(harnesses[0], synth_fill(["<per-harness review JSONs>"]), cdir, dry_run=True)
-        log("dry run complete — no engines executed, nothing posted")
-        return
+        if args.dry_run:
+            for h in harnesses:
+                run_engine(h, gen_prompt, cdir, dry_run=True)
+            if verify_fill:
+                run_engine(harnesses[0], verify_fill({"<the>": "<generated review JSON>"}), cdir, dry_run=True)
+            if len(harnesses) > 1:
+                run_engine(harnesses[0], synth_fill(["<per-harness review JSONs>"]), cdir, dry_run=True)
+            log("dry run complete — no engines executed, nothing posted")
+            return
 
-    final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "pr")
-    markdown = render_markdown(final, harnesses, args.depth, bar, merge_base)
-    return post_or_print(args, token, markdown, "review")
+        final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "pr")
+        markdown = render_markdown(final, harnesses, args.depth, bar, merge_base)
+        return post_or_print(args, token, markdown, "review")
 
 
 def do_issue_triage(args, harnesses, bar, focus, token, auth):
@@ -685,45 +830,47 @@ def do_issue_triage(args, harnesses, bar, focus, token, auth):
     # triggering @mention and later comments would silently never reach the prompt.
     comments = api_paged(f"repos/{args.owner}/{args.repo}/issues/{args.issue}/comments", token)
 
-    cdir, head_sha = prepare_head_checkout(args.owner, args.repo, default_branch, auth, args.repo_dir or None)
-    conv = convention_files(cdir)
-    conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
-    issue_block = issue_context_block(issue, comments)
+    checkout, head_sha = prepare_head_checkout(args.owner, args.repo, default_branch, auth, args.repo_dir or None)
+    with checkout:
+        cdir = checkout.wt  # the private per-run worktree — the engine's cwd
+        conv = convention_files(cdir)
+        conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
+        issue_block = issue_context_block(issue, comments)
 
-    gen_prompt = fill(
-        TRIAGE_PROMPT_FILE,
-        {
-            "DEFAULT_BRANCH": default_branch,
-            "REPO": f"{args.owner}/{args.repo}",
-            "ISSUE_BLOCK": issue_block,
-            "CONVENTION_FILES": conv_str,
-            "FOCUS": focus,
-            "CONFIDENCE_BAR": bar,
-        },
-    )
-    verify_fill = None
-    if args.depth != "quick":
-        verify_fill = lambda r: fill(  # noqa: E731
-            TRIAGE_VERIFY_PROMPT_FILE,
-            {"DEFAULT_BRANCH": default_branch, "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+        gen_prompt = fill(
+            TRIAGE_PROMPT_FILE,
+            {
+                "DEFAULT_BRANCH": default_branch,
+                "REPO": f"{args.owner}/{args.repo}",
+                "ISSUE_BLOCK": issue_block,
+                "CONVENTION_FILES": conv_str,
+                "FOCUS": focus,
+                "CONFIDENCE_BAR": bar,
+            },
         )
-    synth_fill = lambda rs: fill(  # noqa: E731
-        TRIAGE_SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
-    )
+        verify_fill = None
+        if args.depth != "quick":
+            verify_fill = lambda r: fill(  # noqa: E731
+                TRIAGE_VERIFY_PROMPT_FILE,
+                {"DEFAULT_BRANCH": default_branch, "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+            )
+        synth_fill = lambda rs: fill(  # noqa: E731
+            TRIAGE_SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
+        )
 
-    if args.dry_run:
-        for h in harnesses:
-            run_engine(h, gen_prompt, cdir, dry_run=True)
-        if verify_fill:
-            run_engine(harnesses[0], verify_fill({"<the>": "<generated triage JSON>"}), cdir, dry_run=True)
-        if len(harnesses) > 1:
-            run_engine(harnesses[0], synth_fill(["<per-harness triage JSONs>"]), cdir, dry_run=True)
-        log("dry run complete — no engines executed, nothing posted")
-        return
+        if args.dry_run:
+            for h in harnesses:
+                run_engine(h, gen_prompt, cdir, dry_run=True)
+            if verify_fill:
+                run_engine(harnesses[0], verify_fill({"<the>": "<generated triage JSON>"}), cdir, dry_run=True)
+            if len(harnesses) > 1:
+                run_engine(harnesses[0], synth_fill(["<per-harness triage JSONs>"]), cdir, dry_run=True)
+            log("dry run complete — no engines executed, nothing posted")
+            return
 
-    final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "issue")
-    markdown = render_triage_markdown(final, harnesses, args.depth, bar, head_sha)
-    return post_or_print(args, token, markdown, "triage")
+        final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "issue")
+        markdown = render_triage_markdown(final, harnesses, args.depth, bar, head_sha)
+        return post_or_print(args, token, markdown, "triage")
 
 
 def main():
