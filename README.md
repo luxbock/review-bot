@@ -1,10 +1,25 @@
 # review-bot
 
-Automated Forgejo PR reviewer + issue-triage routine. A stdlib-only Python
-program that runs a portable review prompt on a selectable engine (`claude` /
-`codex`), then posts **one** Markdown comment to a Forgejo PR (or issue) as a
-read-only `review-bot` identity via REST — it never pushes, never merges, never
+Automated Forgejo PR reviewer + issue-triage + whole-repo maintainability
+auditor. A stdlib-only Python program that runs a portable prompt on a
+selectable engine (`claude` / `codex`), then posts **one** Markdown comment to a
+Forgejo PR (or issue) — or, in audit mode, **files one prioritized issue** — as a
+read-only `review-bot` identity via REST. It never pushes, never merges, never
 uses `fj`.
+
+Three modes, sharing all the identity/git/engine/post plumbing:
+
+- `--mode pr` (default) — reviews a PR diff and posts one review comment.
+- `--mode issue` — triages a filed issue and posts one triage comment.
+- `--mode repo` — runs a whole-repository maintainability pass (categories:
+  duplication, dead code, layering drift, test-coverage-gap hotspots) and
+  **creates one prioritized issue** (title `review-bot audit: <owner>/<repo>
+  maintainability findings`) whose body is a ranked finding list. Takes **no**
+  `--pr`/`--issue` number (`--scope repo` is an alias). It POSTs `{title, body}`
+  to the create-issue endpoint (not comments), feeding the same issue-driven fix
+  pipeline. Consistent with review-bot's read-only charter it applies **no
+  labels** (it never touches the labels API); if a prior open audit issue exists
+  it links it (`Supersedes #N`) rather than closing it.
 
 - `review.py` → `review-bot-review-local` — the in-process reviewer/triager
   (engine-agnostic); also the module `review-bot-serve` imports.
@@ -49,9 +64,9 @@ Fields are whitelisted (an unknown field is a hard error):
 
 | field            | type | notes                                          |
 |------------------|------|------------------------------------------------|
-| `mode`           | str  | `"pr"` (default) \| `"issue"`                  |
+| `mode`           | str  | `"pr"` (default) \| `"issue"` \| `"repo"`      |
 | `owner`, `repo`  | str  | required; `[A-Za-z0-9_.-]+`                    |
-| `number`         | int  | required; positive PR/issue number             |
+| `number`         | int  | positive PR/issue number; required for pr/issue, **omitted for `repo`** (numberless audit) |
 | `harness`        | str  | `claude` \| `codex` \| `claude,codex`          |
 | `depth`          | str  | `quick` \| `standard` \| `deep`                |
 | `confidence_bar` | str  | `""` \| `low` \| `medium` \| `high`            |

@@ -45,7 +45,10 @@ runCommand "review-bot"
       --replace-fail '@SYNTHESIS_PROMPT@' ${./synthesis-prompt.md} \
       --replace-fail '@TRIAGE_PROMPT@' ${./triage-prompt.md} \
       --replace-fail '@TRIAGE_VERIFY_PROMPT@' ${./triage-verify-prompt.md} \
-      --replace-fail '@TRIAGE_SYNTHESIS_PROMPT@' ${./triage-synthesis-prompt.md}
+      --replace-fail '@TRIAGE_SYNTHESIS_PROMPT@' ${./triage-synthesis-prompt.md} \
+      --replace-fail '@AUDIT_PROMPT@' ${./audit-prompt.md} \
+      --replace-fail '@AUDIT_VERIFY_PROMPT@' ${./audit-verify-prompt.md} \
+      --replace-fail '@AUDIT_SYNTHESIS_PROMPT@' ${./audit-synthesis-prompt.md}
     mkdir -p $out/bin
     ln -s ../lib/review-bot/review.py $out/bin/review-bot-review-local
 
