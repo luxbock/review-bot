@@ -56,6 +56,9 @@ SYNTHESIS_PROMPT_FILE = "@SYNTHESIS_PROMPT@"
 TRIAGE_PROMPT_FILE = "@TRIAGE_PROMPT@"
 TRIAGE_VERIFY_PROMPT_FILE = "@TRIAGE_VERIFY_PROMPT@"
 TRIAGE_SYNTHESIS_PROMPT_FILE = "@TRIAGE_SYNTHESIS_PROMPT@"
+AUDIT_PROMPT_FILE = "@AUDIT_PROMPT@"
+AUDIT_VERIFY_PROMPT_FILE = "@AUDIT_VERIFY_PROMPT@"
+AUDIT_SYNTHESIS_PROMPT_FILE = "@AUDIT_SYNTHESIS_PROMPT@"
 
 # ── Runtime config (env-overridable so olli can tune without a rebuild) ────────
 FORGE_URL = os.environ.get("FORGEJO_URL", "http://10.0.150.1:3000").rstrip("/")
@@ -441,6 +444,37 @@ def normalize_triage(obj):
     }
 
 
+def normalize_audit(obj):
+    """Normalize the audit schema: a ranked finding list with NO verdict. Reuses the same
+    finding shape and severity sanitising as normalize(); preserves the engine's ordering
+    (findings are returned most-severe-first, so we do NOT re-sort here)."""
+    if not isinstance(obj, dict):
+        die("engine returned non-object JSON")
+    findings = obj.get("findings") or []
+    if not isinstance(findings, list):
+        findings = []
+    clean = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        sev = f.get("severity", "question")
+        if sev not in SEVERITY_ORDER:
+            sev = "question"
+        clean.append(
+            {
+                "file": str(f.get("file", "") or ""),
+                "line_start": f.get("line_start"),
+                "line_end": f.get("line_end"),
+                "severity": sev,
+                "confidence": f.get("confidence", "medium"),
+                "title": str(f.get("title", "") or "(untitled finding)"),
+                "rationale": str(f.get("rationale", "") or ""),
+                "suggestion": str(f.get("suggestion", "") or ""),
+            }
+        )
+    return {"summary": str(obj.get("summary", "") or ""), "findings": clean}
+
+
 # Compact schema reminders for the reformat retry (the full schemas live in the prompt
 # files; this is just enough for the engine to re-emit its own conclusions as JSON).
 REVIEW_SCHEMA_HINT = (
@@ -453,6 +487,11 @@ TRIAGE_SCHEMA_HINT = (
     '{"summary":"...","assessment":"...","grounding":"...","recommended_action":"...",'
     '"confidence":"high|medium|low",'
     '"disposition":"works-as-designed|docs-gap|genuine-bug|enhancement|wrong-repo|needs-info"}'
+)
+AUDIT_SCHEMA_HINT = (
+    '{"summary":"...","findings":[{"file":"...","line_start":N,"line_end":N,'
+    '"severity":"blocker|major|minor|nit|question","confidence":"high|medium|low",'
+    '"title":"...","rationale":"...","suggestion":"..."}]}  // NO verdict; findings ranked most-severe-first'
 )
 REFORMAT_INSTRUCTION = (
     "Your previous response was NOT valid JSON. Re-express EXACTLY the same conclusions "
@@ -485,8 +524,12 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr"):
     raw = run_engine(harness, prompt, cwd, dry_run=dry_run)
     if dry_run or raw is None:
         return None
-    norm = normalize_triage if mode == "issue" else normalize
-    key = "disposition" if mode == "issue" else "verdict"
+    if mode == "issue":
+        norm, key = normalize_triage, "disposition"
+    elif mode == "repo":
+        norm, key = normalize_audit, "findings"
+    else:
+        norm, key = normalize, "verdict"
 
     result, text = _parse_engine_output(raw, harness, key, norm)
     if result is not None:
@@ -498,7 +541,7 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr"):
     # sound. Ask the engine to reformat its own prior output as strict JSON before giving
     # up: cheaper and more faithful than discarding the review or re-generating it.
     log(f"{harness} did not return parseable JSON; attempting one reformat retry")
-    schema_hint = TRIAGE_SCHEMA_HINT if mode == "issue" else REVIEW_SCHEMA_HINT
+    schema_hint = {"issue": TRIAGE_SCHEMA_HINT, "repo": AUDIT_SCHEMA_HINT}.get(mode, REVIEW_SCHEMA_HINT)
     repaired = run_engine(
         harness, REFORMAT_INSTRUCTION.format(schema=schema_hint, prior=text[-6000:]), cwd
     )
@@ -575,6 +618,47 @@ def render_triage_markdown(triage, harnesses, depth, bar, head_sha):
     return "\n".join(out)
 
 
+def render_audit_markdown(audit, repo, harnesses, depth, bar, head_sha, supersedes=None):
+    """Render the ranked audit findings as the BODY of a create-issue POST. Findings arrive
+    most-severe-first; we preserve that order but group under severity-band headers using the
+    existing SEVERITY_ORDER / SEVERITY_EMOJI vocabulary."""
+    findings = audit["findings"]
+    # Stable-sort by band so ordering within a band is preserved (list.sort is stable).
+    findings = sorted(findings, key=lambda f: SEVERITY_ORDER.index(f["severity"]))
+    out = [f"## 🤖 review-bot audit — {repo} maintainability findings", ""]
+    if audit["summary"]:
+        out += [audit["summary"], ""]
+    if supersedes:
+        out += [f"Supersedes #{supersedes}.", ""]
+    if not findings:
+        out += [f"No maintainability findings at or above the **{bar}** confidence bar.", ""]
+    else:
+        out += [f"### Findings ({len(findings)})", ""]
+        current_band = None
+        for f in findings:
+            sev = f["severity"]
+            if sev != current_band:
+                current_band = sev
+                out += [f"### {SEVERITY_EMOJI[sev]} {sev}", ""]
+            loc = fmt_loc(f)
+            head = f"#### {SEVERITY_EMOJI[sev]} {sev} · {f['confidence']}"
+            if loc:
+                head += f" · {loc}"
+            out += [head, f"**{f['title']}**", ""]
+            if f["rationale"]:
+                out += [f["rationale"], ""]
+            if f["suggestion"]:
+                out += ["> **suggestion:** " + f["suggestion"].replace("\n", "\n> "), ""]
+    hlabel = ",".join(harnesses)
+    out += [
+        "---",
+        f"*Automated audit by **review-bot** · harness `{hlabel}` · depth `{depth}` · "
+        f"bar `{bar}` · repo tip `{head_sha[:12]}`. Advisory only — olli decides which "
+        f"findings become fixes. Re-run with `@review-bot audit`.*",
+    ]
+    return "\n".join(out)
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 def load_token():
     for cand in TOKEN_FILE_CANDIDATES:
@@ -626,6 +710,55 @@ def post_or_print(args, token, markdown, kind):
     url = created.get("html_url") or None
     log(f"posted {kind} comment: {url or '(no html_url returned)'}")
     print(url or "(posted; no html_url returned)")
+    return markdown, url
+
+
+AUDIT_TITLE_PREFIX = "review-bot audit:"
+AUDIT_LABELS = ["audit", "review-bot"]
+
+
+def find_existing_audit_issue(owner, repo, token):
+    """GET open issues; return the number of a prior audit issue (matched by the title
+    prefix or the audit label) so the new body can link it, else None. Best-effort — never
+    fails the audit."""
+    try:
+        issues = api_paged(f"repos/{owner}/{repo}/issues?state=open&type=issues", token)
+    except SystemExit:
+        raise
+    except Exception:
+        return None
+    for it in issues:
+        if it.get("pull_request"):
+            continue
+        title = (it.get("title") or "").strip()
+        labels = {lb.get("name", "") for lb in (it.get("labels") or [])}
+        if title.startswith(AUDIT_TITLE_PREFIX) or (set(AUDIT_LABELS) & labels):
+            num = it.get("number")
+            if isinstance(num, int):
+                return num
+    return None
+
+
+def post_or_create_issue(args, token, title, markdown, kind):
+    """CREATE an issue (NOT a comment) with the rendered audit body. Returns (markdown, url).
+    Honours --print-only (render, don't POST). Tries with the audit labels first; if label
+    creation/attachment fails (labels may not exist on the repo), retries WITHOUT labels
+    rather than failing the whole audit."""
+    if args.print_only:
+        print(markdown)
+        return markdown, None
+    path = f"repos/{args.owner}/{args.repo}/issues"
+    try:
+        created = api("POST", path, token, data={"title": title, "body": markdown, "labels": AUDIT_LABELS})
+    except (SystemExit, Exception):
+        # api() dies on HTTP error (e.g. labels don't exist on the repo). die() is
+        # sys.exit under the CLI but monkeypatched to raise under serve.py, so catch both
+        # — retry label-free rather than failing the whole audit.
+        log("create-issue with labels failed; retrying without labels")
+        created = api("POST", path, token, data={"title": title, "body": markdown})
+    url = created.get("html_url") or None
+    log(f"created {kind} issue: {url or '(no html_url returned)'}")
+    print(url or "(created; no html_url returned)")
     return markdown, url
 
 
@@ -726,11 +859,63 @@ def do_issue_triage(args, harnesses, bar, focus, token, auth):
     return post_or_print(args, token, markdown, "triage")
 
 
+def do_repo_audit(args, harnesses, bar, focus, token, auth):
+    """mode=repo: check out the default-branch tip, run the audit prompt (the engine explores
+    the tree itself), and file ONE prioritized issue via create-issue (not a PR comment)."""
+    repo_meta = api("GET", f"repos/{args.owner}/{args.repo}", token)
+    default_branch = repo_meta.get("default_branch") or "master"
+
+    cdir, head_sha = prepare_head_checkout(args.owner, args.repo, default_branch, auth, args.repo_dir or None)
+    conv = convention_files(cdir)
+    conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
+
+    gen_prompt = fill(
+        AUDIT_PROMPT_FILE,
+        {
+            "DEFAULT_BRANCH": default_branch,
+            "REPO": f"{args.owner}/{args.repo}",
+            "CONVENTION_FILES": conv_str,
+            "FOCUS": focus,
+            "CONFIDENCE_BAR": bar,
+        },
+    )
+    verify_fill = None
+    if args.depth != "quick":
+        verify_fill = lambda r: fill(  # noqa: E731
+            AUDIT_VERIFY_PROMPT_FILE,
+            {"DEFAULT_BRANCH": default_branch, "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+        )
+    synth_fill = lambda rs: fill(  # noqa: E731
+        AUDIT_SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
+    )
+
+    if args.dry_run:
+        for h in harnesses:
+            run_engine(h, gen_prompt, cdir, dry_run=True)
+        if verify_fill:
+            run_engine(harnesses[0], verify_fill({"<the>": "<generated audit JSON>"}), cdir, dry_run=True)
+        if len(harnesses) > 1:
+            run_engine(harnesses[0], synth_fill(["<per-harness audit JSONs>"]), cdir, dry_run=True)
+        log("dry run complete — no engines executed, nothing posted")
+        return
+
+    final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "repo")
+    # Dedup: link (not close) a prior audit issue if one is open. Skipped under --print-only.
+    supersedes = None
+    if not args.print_only:
+        supersedes = find_existing_audit_issue(args.owner, args.repo, token)
+    repo_slug = f"{args.owner}/{args.repo}"
+    markdown = render_audit_markdown(final, repo_slug, harnesses, args.depth, bar, head_sha, supersedes)
+    title = f"{AUDIT_TITLE_PREFIX} {repo_slug} maintainability findings"
+    return post_or_create_issue(args, token, title, markdown, "audit")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run review-bot on a Forgejo PR or issue.")
     ap.add_argument("--owner", required=True)
     ap.add_argument("--repo", required=True)
-    ap.add_argument("--mode", default="", choices=["", "pr", "issue"], help="pr (default) | issue")
+    ap.add_argument("--mode", default="", choices=["", "pr", "issue", "repo"], help="pr (default) | issue | repo")
+    ap.add_argument("--scope", default="", choices=["", "repo"], help="alias: --scope repo maps to --mode repo")
     ap.add_argument("--pr", type=int, help="PR number (mode=pr)")
     ap.add_argument("--issue", type=int, help="issue number (mode=issue)")
     ap.add_argument("--harness", default="claude", help="claude | codex | claude,codex")
@@ -742,14 +927,21 @@ def main():
     ap.add_argument("--print-only", action="store_true", help="run engines but print markdown, don't POST")
     args = ap.parse_args()
 
-    # Resolve mode: explicit --mode wins; else infer from which target number was given.
+    # Resolve mode: --scope repo is an alias for --mode repo; explicit --mode wins; else
+    # infer from which target number was given. mode=repo takes NO --pr/--issue number.
     mode = args.mode
+    if args.scope == "repo":
+        if mode and mode != "repo":
+            die("--scope repo conflicts with --mode " + mode)
+        mode = "repo"
     if not mode:
         mode = "issue" if (args.issue is not None and args.pr is None) else "pr"
     if mode == "pr" and args.pr is None:
         die("mode=pr requires --pr N")
     if mode == "issue" and args.issue is None:
         die("mode=issue requires --issue N")
+    if mode == "repo" and (args.pr is not None or args.issue is not None):
+        die("mode=repo takes no --pr/--issue number (it audits the whole repo)")
     args.mode = mode
 
     harnesses = [h.strip() for h in args.harness.split(",") if h.strip()]
@@ -764,6 +956,8 @@ def main():
     try:
         if mode == "issue":
             do_issue_triage(args, harnesses, bar, focus, token, auth)
+        elif mode == "repo":
+            do_repo_audit(args, harnesses, bar, focus, token, auth)
         else:
             do_pr_review(args, harnesses, bar, focus, token, auth)
     finally:

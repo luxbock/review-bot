@@ -48,15 +48,24 @@ def build_request(args):
         )
 
     mode = args.mode
+    if args.scope == "repo":
+        if mode and mode != "repo":
+            die("--scope repo conflicts with --mode " + mode)
+        mode = "repo"
     if not mode:
         mode = "issue" if (args.issue is not None and args.pr is None) else "pr"
     if mode == "pr" and args.pr is None:
         die("mode=pr requires --pr N")
     if mode == "issue" and args.issue is None:
         die("mode=issue requires --issue N")
-    number = args.pr if mode == "pr" else args.issue
-    if number <= 0:
-        die(f"--{'pr' if mode == 'pr' else 'issue'} must be a positive integer")
+    if mode == "repo" and (args.pr is not None or args.issue is not None):
+        die("mode=repo takes no --pr/--issue number (it audits the whole repo)")
+    # mode=repo is numberless — the whole-repo audit needs no PR/issue target.
+    number = None
+    if mode != "repo":
+        number = args.pr if mode == "pr" else args.issue
+        if number <= 0:
+            die(f"--{'pr' if mode == 'pr' else 'issue'} must be a positive integer")
 
     harnesses = [h.strip() for h in args.harness.split(",") if h.strip()]
     for h in harnesses:
@@ -65,11 +74,10 @@ def build_request(args):
     if not harnesses:
         die("no harness given")
 
-    return {
+    request = {
         "mode": mode,
         "owner": args.owner,
         "repo": args.repo,
-        "number": number,
         "harness": ",".join(harnesses),
         "depth": args.depth,
         "confidence_bar": args.confidence_bar,
@@ -77,6 +85,10 @@ def build_request(args):
         "print_only": args.print_only,
         "dry_run": args.dry_run,
     }
+    # Omit 'number' entirely for repo mode (serve.py makes it optional only for repo).
+    if number is not None:
+        request["number"] = number
+    return request
 
 
 def connect(path):
@@ -101,7 +113,8 @@ def main():
     ap = argparse.ArgumentParser(description="Run review-bot on a Forgejo PR or issue (via the review-bot service).")
     ap.add_argument("--owner", required=True)
     ap.add_argument("--repo", required=True)
-    ap.add_argument("--mode", default="", choices=["", "pr", "issue"], help="pr (default) | issue")
+    ap.add_argument("--mode", default="", choices=["", "pr", "issue", "repo"], help="pr (default) | issue | repo")
+    ap.add_argument("--scope", default="", choices=["", "repo"], help="alias: --scope repo maps to --mode repo")
     ap.add_argument("--pr", type=int, help="PR number (mode=pr)")
     ap.add_argument("--issue", type=int, help="issue number (mode=issue)")
     ap.add_argument("--harness", default="claude", help="claude | codex | claude,codex")

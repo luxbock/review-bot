@@ -9,9 +9,10 @@ review/triage pipeline (imported from review.py; the service user owns the LLM
 and forge credentials, callers never do) and streams NDJSON events on stdout.
 
 Request fields (whitelist — any unknown field is a hard error):
-  mode            "pr" (default) | "issue"
+  mode            "pr" (default) | "issue" | "repo"
   owner, repo     required, [A-Za-z0-9_.-]+
-  number          required, positive int (the PR / issue number)
+  number          required positive int for pr/issue; OMITTED for mode=repo
+                  (the whole-repo maintainability audit is numberless)
   harness         "claude" | "codex" | "claude,codex"          (default claude)
   depth           quick | standard | deep                      (default standard)
   confidence_bar  "" | low | medium | high                     (default "")
@@ -177,12 +178,17 @@ def parse_request(line, review):
     if unknown:
         raise RequestError(f"unknown request field(s): {', '.join(unknown)}")
 
-    mode = _req_enum(req, "mode", ("pr", "issue"), "pr")
+    mode = _req_enum(req, "mode", ("pr", "issue", "repo"), "pr")
     owner = _req_name(req, "owner")
     repo = _req_name(req, "repo")
 
+    # 'number' is required-positive for pr/issue, but mode=repo is numberless (whole-repo
+    # audit) — it must be absent (or explicitly null) there.
     number = req.get("number")
-    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+    if mode == "repo":
+        if number is not None:
+            raise RequestError("'number' must not be set for mode=repo (the whole-repo audit takes no PR/issue number)")
+    elif isinstance(number, bool) or not isinstance(number, int) or number <= 0:
         raise RequestError("'number' is required and must be a positive integer")
 
     harness = req.get("harness", "claude")
@@ -205,7 +211,7 @@ def parse_request(line, review):
         owner=owner,
         repo=repo,
         pr=number if mode == "pr" else None,
-        issue=number if mode == "issue" else None,
+        issue=number if mode == "issue" else None,  # both None for mode=repo
         harness=",".join(harnesses),
         depth=depth,
         focus=focus,
@@ -241,11 +247,12 @@ def main():
         sys.exit(1)
 
     num = args.pr if args.mode == "pr" else args.issue
+    target = f"#{num}" if num is not None else ""  # mode=repo is numberless
     emit(
         proto,
         {
             "type": "log",
-            "message": f"{args.mode} {args.owner}/{args.repo}#{num} "
+            "message": f"{args.mode} {args.owner}/{args.repo}{target} "
             f"(harness={args.harness} depth={args.depth} bar={bar})",
         },
     )
@@ -260,6 +267,8 @@ def main():
         with contextlib.redirect_stdout(sys.stderr):
             if args.mode == "issue":
                 res = review.do_issue_triage(args, harnesses, bar, focus, token, auth)
+            elif args.mode == "repo":
+                res = review.do_repo_audit(args, harnesses, bar, focus, token, auth)
             else:
                 res = review.do_pr_review(args, harnesses, bar, focus, token, auth)
         if res is not None:  # None ⇔ dry_run (nothing generated)
