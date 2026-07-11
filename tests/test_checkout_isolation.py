@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -228,6 +229,57 @@ class CheckoutIsolationTest(unittest.TestCase):
         wt_root = os.path.join(cdir, ".wt")
         leftover = os.listdir(wt_root) if os.path.isdir(wt_root) else []
         self.assertEqual(leftover, [], f".wt/ accumulated leftovers: {leftover}")
+
+    def test_sweep_spares_live_runs_and_reaps_dead(self):
+        # Regression for the self-inflicted bug: sweep_stale_worktrees must NOT
+        # force-remove a worktree that a still-live concurrent run owns. The barrier in
+        # the other tests hides this by making both runs sweep before either adds a tree;
+        # here we build the exact ordering — a live-owner worktree already on disk when a
+        # new run sweeps — and assert it survives, while a dead-owner one is reaped.
+        cdir = self.review.ensure_clone(self.owner, self.repo, self.auth, None)
+        self.review.git(
+            ["fetch", "--quiet", "origin", "+refs/heads/main:refs/rb-test/main"],
+            cwd=cdir,
+            auth=self.auth,
+        )
+
+        # Owner pid = OUR pid (guaranteed alive) — a stand-in for a concurrent run.
+        live_pid = os.getpid()
+        live_runid = f"{live_pid}-{uuid.uuid4().hex[:8]}"
+        live_wt = self.review.add_worktree(cdir, live_runid, "refs/rb-test/main", self.auth)
+
+        # Owner pid = a reaped child (guaranteed dead) — a crashed run's leftover.
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        dead_pid = child.pid
+        self.assertFalse(self.review._pid_is_alive(dead_pid), "child pid should be reaped/dead")
+        dead_runid = f"{dead_pid}-{uuid.uuid4().hex[:8]}"
+        dead_wt = self.review.add_worktree(cdir, dead_runid, "refs/rb-test/main", self.auth)
+
+        self.assertTrue(os.path.isdir(live_wt))
+        self.assertTrue(os.path.isdir(dead_wt))
+
+        self.review.sweep_stale_worktrees(cdir, self.auth)
+
+        # The live-owner worktree MUST survive; the dead-owner one MUST be reaped.
+        self.assertTrue(
+            os.path.isdir(live_wt), "sweep destroyed a live concurrent run's worktree"
+        )
+        self.assertFalse(
+            os.path.exists(dead_wt), "sweep failed to reap a dead-owner (crashed) worktree"
+        )
+
+        # And the age guard: even a live owner does not protect a truly-ancient tree.
+        old_secs = self.review.WT_STALE_SECS
+        try:
+            self.review.WT_STALE_SECS = -1  # everything is "older than threshold"
+            self.review.sweep_stale_worktrees(cdir, self.auth)
+            self.assertFalse(
+                os.path.exists(live_wt),
+                "age guard failed: an over-threshold tree should be reaped despite a live owner",
+            )
+        finally:
+            self.review.WT_STALE_SECS = old_secs
 
     def test_issue_head_checkout_isolated_and_cleaned(self):
         checkout, head = self.review.prepare_head_checkout(

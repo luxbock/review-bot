@@ -74,6 +74,10 @@ CACHE_ROOT = os.environ.get(
     os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "review-bot"),
 )
 ENGINE_TIMEOUT = int(os.environ.get("REVIEW_BOT_ENGINE_TIMEOUT", "1800"))
+# Age past which a leftover per-run worktree is considered stale even if a live process
+# happens to share its (possibly reused) owner pid. Default 6h — comfortably above any
+# real multi-engine run (ENGINE_TIMEOUT is 30min per engine).
+WT_STALE_SECS = int(os.environ.get("REVIEW_BOT_WT_STALE_SECS", "21600"))
 DIFF_INLINE_CAP = int(os.environ.get("REVIEW_BOT_DIFF_CAP", "60000"))
 
 # The harness commands are env-overridable because the exact CLI flags for headless
@@ -269,13 +273,56 @@ def _wt_root(cdir):
     return os.path.join(cdir, ".wt")
 
 
+def _pid_is_alive(pid):
+    """True if `pid` names a live process. os.kill(pid, 0) is the portable liveness probe:
+    ProcessLookupError => dead; PermissionError => alive but not ours (treat as alive)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True  # be conservative — an ambiguous error must not delete a live tree
+
+
+def _worktree_is_stale(name, path, now):
+    """A leftover .wt/<name> is stale (safe to reap) only if its OWNER run is gone.
+
+    runid is "{pid}-{uuid}", so the leading int is the owning process's pid:
+      - owner pid still alive  -> NOT stale (a concurrent run is using this tree); UNLESS
+      - the dir is older than WT_STALE_SECS  -> stale anyway (belt-and-suspenders against
+        pid reuse — a truly ancient tree can't be protected forever by a recycled pid).
+    An unparseable name has no owner we can check, so it's treated as stale."""
+    try:
+        age = now - os.path.getmtime(path)
+    except OSError:
+        age = 0.0
+    if age > WT_STALE_SECS:
+        return True
+    pid_str = name.split("-", 1)[0]
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        return True  # can't identify an owner -> assume orphaned
+    return not _pid_is_alive(pid)
+
+
 def sweep_stale_worktrees(cdir, auth):
-    """Best-effort crash cleanup: drop leftover .wt/* dirs from runs that died before
-    their finally-block ran, then let git forget them. Never fatal — this is hygiene."""
+    """Best-effort crash cleanup: drop ONLY leftover .wt/* dirs whose owning run is gone
+    (dead owner pid, or older than WT_STALE_SECS), then let git forget them. Worktrees
+    owned by a still-live concurrent run are LEFT ALONE — force-removing them would
+    destroy that run's checkout mid-review. Never fatal — this is hygiene."""
+    import time as _time
+
     root = _wt_root(cdir)
     if os.path.isdir(root):
+        now = _time.time()
         for name in os.listdir(root):
             path = os.path.join(root, name)
+            if not _worktree_is_stale(name, path, now):
+                continue
             try:
                 git(["worktree", "remove", "--force", path], cwd=cdir, auth=auth, check=False)
                 if os.path.exists(path):
