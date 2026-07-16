@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -85,8 +86,10 @@ def make_stub_engine(tmpdir, payload):
     path = os.path.join(tmpdir, "stub-engine.py")
     with open(path, "w") as f:
         f.write("#!" + sys.executable + "\n")
-        f.write("import sys\n")
-        f.write("sys.stdin.read()\n")  # consume the prompt like a real engine
+        f.write("import os, sys\n")
+        f.write("prompt = sys.stdin.read()\n")
+        f.write("assert os.path.isfile('src/widget.py'), os.getcwd()\n")
+        f.write("assert os.path.isdir('.git') and 'README.md' in prompt\n")
         f.write("sys.stdout.write(%r)\n" % envelope)
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IRWXU)
     return path
@@ -115,14 +118,60 @@ def fresh_review():
     return wire_review(review)
 
 
-# A checked-out repo tree the audit "explores". We stub prepare_head_checkout so no git
-# fetch happens, but the engine cwd must exist.
+class RecordingCheckout:
+    """Checkout-shaped double with a deliberately non-path-like identity."""
+
+    def __init__(self, wt, events):
+        self.wt = wt
+        self.events = events
+        self.entered = False
+        self.exited = False
+
+    def __fspath__(self):
+        raise AssertionError("Checkout itself reached a filesystem or subprocess API")
+
+    def __enter__(self):
+        assert not self.entered
+        self.entered = True
+        self.events.append("enter")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        assert self.entered
+        self.exited = True
+        self.events.append(("exit", exc_type))
+        return False
+
+
+def make_git_tree(parent, minimal=False):
+    """Create the local default-branch tree exposed as Checkout.wt."""
+    wt = os.path.join(parent, "private-worktree")
+    os.makedirs(wt)
+    subprocess.run([shutil.which("git"), "init", "-q", wt], check=True)
+    if not minimal:
+        with open(os.path.join(wt, "README.md"), "w") as f:
+            f.write("# Widget\n\nRepository conventions live here.\n")
+        src = os.path.join(wt, "src")
+        os.makedirs(src)
+        with open(os.path.join(src, "widget.py"), "w") as f:
+            f.write("def widget():\n    return 42\n")
+        subprocess.run([shutil.which("git"), "-C", wt, "add", "."], check=True)
+        subprocess.run(
+            [shutil.which("git"), "-C", wt, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "-qm", "fixture"],
+            check=True,
+        )
+    return wt
+
+
 @contextlib.contextmanager
-def fake_checkout(review, cdir, head="abc123def456"):
+def fake_checkout(review, wt, events=None, head="abc123def456"):
     orig = review.prepare_head_checkout
-    review.prepare_head_checkout = lambda owner, repo, db, auth, repo_dir=None: (cdir, head)
+    events = events if events is not None else []
+    checkout = RecordingCheckout(wt, events)
+    review.prepare_head_checkout = lambda owner, repo, db, auth, repo_dir=None: (checkout, head)
     try:
-        yield
+        yield checkout
     finally:
         review.prepare_head_checkout = orig
 
@@ -139,9 +188,18 @@ def test_dry_run_emits_prompt_runs_nothing():
         review.api = lambda *a, **k: posted.append((a, k)) or {"default_branch": "main"}
 
         args = _Args(dry_run=True)
-        cdir = os.path.join(tmp, "checkout")
-        os.makedirs(cdir)
-        with fake_checkout(review, cdir):
+        wt = make_git_tree(tmp, minimal=True)
+        events = []
+        original_conventions = review.convention_files
+
+        def checked_conventions(path):
+            assert events == ["enter"], "checkout-dependent discovery ran before __enter__"
+            assert path == wt
+            events.append("conventions")
+            return original_conventions(path)
+
+        review.convention_files = checked_conventions
+        with fake_checkout(review, wt, events) as checkout:
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 res = review.do_repo_audit(args, ["claude"], "medium", "(none provided)", "tok", auth=None)
@@ -152,6 +210,8 @@ def test_dry_run_emits_prompt_runs_nothing():
         assert "whole-repository maintainability audit" in text, "audit prompt body missing"
         assert "acme/widget" in text, "REPO placeholder not filled"
         assert "{{REPO}}" not in text and "{{DEFAULT_BRANCH}}" not in text, "unfilled placeholder leaked"
+        assert f"cwd={wt}" in text, "dry-run engine cwd must be Checkout.wt"
+        assert checkout.exited and events[-1] == ("exit", None), events
         # Only the GET repo-meta api call is allowed; no POST.
         assert all(a[0][0] == "GET" for a in posted), f"dry-run must not POST: {posted}"
     print("ok  1. dry-run emits filled prompt, runs no engine, posts nothing")
@@ -174,10 +234,9 @@ def test_print_only_renders_no_post():
         review.api = fake_api
 
         args = _Args(print_only=True)
-        cdir = os.path.join(tmp, "checkout")
-        os.makedirs(cdir)
+        wt = make_git_tree(tmp)
         out = io.StringIO()
-        with fake_checkout(review, cdir):
+        with fake_checkout(review, wt) as checkout:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 markdown, url = review.do_repo_audit(args, ["claude"], "medium", "(none provided)", "tok", auth=None)
 
@@ -194,6 +253,7 @@ def test_print_only_renders_no_post():
         assert "Automated audit by **review-bot**" in markdown, "audit footer marker missing"
         # stdout got the markdown (print-only contract).
         assert "review-bot audit" in out.getvalue()
+        assert checkout.exited, "print-only must exit Checkout"
     print("ok  2. print-only renders severity-ordered body, no POST")
 
 
@@ -218,9 +278,8 @@ def test_create_issue_path():
         review.api = fake_api
 
         args = _Args(print_only=False)
-        cdir = os.path.join(tmp, "checkout")
-        os.makedirs(cdir)
-        with fake_checkout(review, cdir):
+        wt = make_git_tree(tmp)
+        with fake_checkout(review, wt) as checkout:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 markdown, url = review.do_repo_audit(args, ["claude"], "medium", "(none provided)", "tok", auth=None)
 
@@ -234,6 +293,7 @@ def test_create_issue_path():
         assert "labels" not in data, "create POST must NOT carry a labels field (review-bot never labels)"
         assert data["body"] == markdown, "posted body must be the rendered markdown"
         assert data["body"].startswith("## 🤖 review-bot audit"), data["body"][:80]
+        assert checkout.exited, "create-issue success must exit Checkout"
     print("ok  3. create-issue POSTs to /issues with title+body (no labels), not /comments")
 
 
@@ -259,9 +319,8 @@ def test_create_issue_supersede_no_labels():
 
         review.api = fake_api
         args = _Args(print_only=False)
-        cdir = os.path.join(tmp, "checkout")
-        os.makedirs(cdir)
-        with fake_checkout(review, cdir):
+        wt = make_git_tree(tmp)
+        with fake_checkout(review, wt) as checkout:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 markdown, url = review.do_repo_audit(args, ["claude"], "medium", "(none provided)", "tok", auth=None)
 
@@ -273,7 +332,64 @@ def test_create_issue_supersede_no_labels():
         assert set(data.keys()) == {"title", "body"}, f"POST must carry only title+body: {sorted(data)}"
         assert "labels" not in data, "create POST must NOT carry a labels field"
         assert "Supersedes #7" in markdown, "prior audit issue must be linked"
+        assert checkout.exited, "deduplication path must exit Checkout"
     print("ok  3b. prior audit issue linked (Supersedes) by title prefix; POST has no labels")
+
+
+def test_all_pipeline_engine_cwds_are_worktree():
+    """Generation, verification, and synthesis all run inside the entered private tree."""
+    with tempfile.TemporaryDirectory() as tmp:
+        review = fresh_review()
+        review.api = lambda method, path, token, data=None: {"default_branch": "main"}
+        wt = make_git_tree(tmp)
+        events = []
+        calls = []
+
+        def fake_review_via(harness, prompt, cwd, dry_run, mode="pr"):
+            assert events and events[0] == "enter"
+            assert cwd == wt
+            calls.append((harness, cwd, mode))
+            return CANNED_AUDIT
+
+        review.review_via = fake_review_via
+        args = _Args(print_only=True, depth="standard")
+        with fake_checkout(review, wt, events) as checkout:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                review.do_repo_audit(args, ["claude", "codex"], "medium", "(none provided)", "tok", auth=None)
+
+        assert len(calls) == 5, f"expected 2 generations + 2 verifications + synthesis: {calls}"
+        assert all(cwd == wt and mode == "repo" for _, cwd, mode in calls), calls
+        assert checkout.exited and events[-1] == ("exit", None), events
+    print("ok  4. generation, verification, and synthesis use entered Checkout.wt")
+
+
+def test_checkout_exits_after_generation_and_verification_failures():
+    """An exception from either engine phase still triggers Checkout cleanup."""
+    for fail_call, depth, phase in [(1, "quick", "generation"), (2, "standard", "verification")]:
+        with tempfile.TemporaryDirectory() as tmp:
+            review = fresh_review()
+            review.api = lambda method, path, token, data=None: {"default_branch": "main"}
+            wt = make_git_tree(tmp)
+            calls = []
+
+            def failing_review_via(harness, prompt, cwd, dry_run, mode="pr"):
+                assert cwd == wt
+                calls.append(cwd)
+                if len(calls) == fail_call:
+                    raise RuntimeError("injected " + phase + " failure")
+                return CANNED_AUDIT
+
+            review.review_via = failing_review_via
+            with fake_checkout(review, wt) as checkout:
+                try:
+                    review.do_repo_audit(
+                        _Args(print_only=True, depth=depth), ["claude"], "medium", "(none provided)", "tok", None
+                    )
+                    raise AssertionError(phase + " failure should escape")
+                except RuntimeError as e:
+                    assert str(e) == "injected " + phase + " failure"
+            assert checkout.exited, phase + " failure must exit Checkout"
+    print("ok  5. generation and verification failures exit Checkout")
 
 
 def test_serve_parse_request_repo_numberless():
@@ -310,7 +426,7 @@ def test_serve_parse_request_repo_numberless():
         pass
     args2, _, _, _ = serve.parse_request(json.dumps({"mode": "pr", "owner": "a", "repo": "b", "number": 5}), review)
     assert args2.pr == 5 and args2.issue is None, vars(args2)
-    print("ok  4. serve.parse_request: repo numberless accepted; unknown field & stray number rejected")
+    print("ok  6. serve.parse_request: repo numberless accepted; unknown field & stray number rejected")
 
 
 def main():
@@ -319,6 +435,8 @@ def main():
         test_print_only_renders_no_post,
         test_create_issue_path,
         test_create_issue_supersede_no_labels,
+        test_all_pipeline_engine_cwds_are_worktree,
+        test_checkout_exits_after_generation_and_verification_failures,
         test_serve_parse_request_repo_numberless,
     ]
     for t in tests:
