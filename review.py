@@ -1075,49 +1075,51 @@ def do_repo_audit(args, harnesses, bar, focus, token, auth):
     repo_meta = api("GET", f"repos/{args.owner}/{args.repo}", token)
     default_branch = repo_meta.get("default_branch") or "master"
 
-    cdir, head_sha = prepare_head_checkout(args.owner, args.repo, default_branch, auth, args.repo_dir or None)
-    conv = convention_files(cdir)
-    conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
+    checkout, head_sha = prepare_head_checkout(args.owner, args.repo, default_branch, auth, args.repo_dir or None)
+    with checkout:
+        cdir = checkout.wt  # the private per-run worktree — the engine's cwd
+        conv = convention_files(cdir)
+        conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
 
-    gen_prompt = fill(
-        AUDIT_PROMPT_FILE,
-        {
-            "DEFAULT_BRANCH": default_branch,
-            "REPO": f"{args.owner}/{args.repo}",
-            "CONVENTION_FILES": conv_str,
-            "FOCUS": focus,
-            "CONFIDENCE_BAR": bar,
-        },
-    )
-    verify_fill = None
-    if args.depth != "quick":
-        verify_fill = lambda r: fill(  # noqa: E731
-            AUDIT_VERIFY_PROMPT_FILE,
-            {"DEFAULT_BRANCH": default_branch, "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+        gen_prompt = fill(
+            AUDIT_PROMPT_FILE,
+            {
+                "DEFAULT_BRANCH": default_branch,
+                "REPO": f"{args.owner}/{args.repo}",
+                "CONVENTION_FILES": conv_str,
+                "FOCUS": focus,
+                "CONFIDENCE_BAR": bar,
+            },
         )
-    synth_fill = lambda rs: fill(  # noqa: E731
-        AUDIT_SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
-    )
+        verify_fill = None
+        if args.depth != "quick":
+            verify_fill = lambda r: fill(  # noqa: E731
+                AUDIT_VERIFY_PROMPT_FILE,
+                {"DEFAULT_BRANCH": default_branch, "REVIEW_JSON": json.dumps(r, indent=2), "CONFIDENCE_BAR": bar},
+            )
+        synth_fill = lambda rs: fill(  # noqa: E731
+            AUDIT_SYNTHESIS_PROMPT_FILE, {"N": str(len(rs)), "REVIEW_JSON_LIST": json.dumps(rs, indent=2)}
+        )
 
-    if args.dry_run:
-        for h in harnesses:
-            run_engine(h, gen_prompt, cdir, dry_run=True)
-        if verify_fill:
-            run_engine(harnesses[0], verify_fill({"<the>": "<generated audit JSON>"}), cdir, dry_run=True)
-        if len(harnesses) > 1:
-            run_engine(harnesses[0], synth_fill(["<per-harness audit JSONs>"]), cdir, dry_run=True)
-        log("dry run complete — no engines executed, nothing posted")
-        return
+        if args.dry_run:
+            for h in harnesses:
+                run_engine(h, gen_prompt, cdir, dry_run=True)
+            if verify_fill:
+                run_engine(harnesses[0], verify_fill({"<the>": "<generated audit JSON>"}), cdir, dry_run=True)
+            if len(harnesses) > 1:
+                run_engine(harnesses[0], synth_fill(["<per-harness audit JSONs>"]), cdir, dry_run=True)
+            log("dry run complete — no engines executed, nothing posted")
+            return
 
-    final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "repo")
-    # Dedup: link (not close) a prior audit issue if one is open. Skipped under --print-only.
-    supersedes = None
-    if not args.print_only:
-        supersedes = find_existing_audit_issue(args.owner, args.repo, token)
-    repo_slug = f"{args.owner}/{args.repo}"
-    markdown = render_audit_markdown(final, repo_slug, harnesses, args.depth, bar, head_sha, supersedes)
-    title = f"{AUDIT_TITLE_PREFIX} {repo_slug} maintainability findings"
-    return post_or_create_issue(args, token, title, markdown, "audit")
+        final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "repo")
+        # Dedup: link (not close) a prior audit issue if one is open. Skipped under --print-only.
+        supersedes = None
+        if not args.print_only:
+            supersedes = find_existing_audit_issue(args.owner, args.repo, token)
+        repo_slug = f"{args.owner}/{args.repo}"
+        markdown = render_audit_markdown(final, repo_slug, harnesses, args.depth, bar, head_sha, supersedes)
+        title = f"{AUDIT_TITLE_PREFIX} {repo_slug} maintainability findings"
+        return post_or_create_issue(args, token, title, markdown, "audit")
 
 
 def main():
