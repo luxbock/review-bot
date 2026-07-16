@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Factory run scaffolding — ephemeral BRIEF/RESULT/etc., never shipped
+/.factory/
