@@ -29,6 +29,11 @@ import sys
 
 SOCKET_PATH = os.environ.get("REVIEW_BOT_SOCKET", "/run/review-bot/review.sock")
 FOCUS_CAP = 2000  # keep in sync with serve.py (server truncates too)
+SERVICE_SOCKET_UNIT = "review-bot-review.socket"
+CONNECTION_LOST = (
+    "the review-bot service connection was lost — the review outcome is unknown "
+    "and may already have posted; inspect the target or service journal before retrying"
+)
 
 
 def die(msg, code=1):
@@ -96,14 +101,29 @@ def connect(path):
     try:
         sock.connect(path)
     except FileNotFoundError:
+        sock.close()
         die(
-            f"review-bot service socket not found at {path} — is review-bot.socket "
-            f"enabled on this host? (set REVIEW_BOT_SOCKET if it lives elsewhere)"
+            f"review-bot service socket not found at {path} — check that "
+            f"{SERVICE_SOCKET_UNIT} is running, or set REVIEW_BOT_SOCKET to the correct path"
         )
-    except (ConnectionRefusedError, PermissionError) as e:
+    except ConnectionRefusedError:
+        sock.close()
         die(
-            f"cannot connect to the review-bot service at {path} ({e}) — "
-            f"check `systemctl status review-bot.socket`"
+            f"review-bot service refused the connection at {path} — check "
+            f"{SERVICE_SOCKET_UNIT} and REVIEW_BOT_SOCKET"
+        )
+    except PermissionError:
+        sock.close()
+        die(
+            f"permission denied connecting to the review-bot service at {path} — check "
+            f"{SERVICE_SOCKET_UNIT} and the review-bot-client supplementary group; after "
+            f"group changes, restart the login/session or any long-running user manager"
+        )
+    except OSError as e:
+        sock.close()
+        die(
+            f"cannot connect to the review-bot service at {path} ({e}) — check "
+            f"{SERVICE_SOCKET_UNIT} and REVIEW_BOT_SOCKET"
         )
     return sock
 
@@ -130,30 +150,46 @@ def main():
     sock = connect(SOCKET_PATH)
     result = None
     try:
-        sock.sendall((json.dumps(request) + "\n").encode())
-        sock.shutdown(socket.SHUT_WR)
-        with sock.makefile("r", encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    print(f"review-bot-review: unparseable event: {line[:200]}", file=sys.stderr)
-                    continue
-                etype = event.get("type")
-                if etype == "log":
-                    print(f"review-bot: {event.get('message', '')}", file=sys.stderr)
-                elif etype == "result":
-                    result = event
-                    break
-                # unknown event types are ignored (forward compatibility)
+        # A peer can finish and send its result while our send/shutdown observes its
+        # close or reset. Keep reading in that case: a complete result is authoritative.
+        try:
+            sock.sendall((json.dumps(request) + "\n").encode())
+        except OSError:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            with sock.makefile("r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        print(f"review-bot-review: unparseable event: {line[:200]}", file=sys.stderr)
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    etype = event.get("type")
+                    if etype == "log":
+                        print(f"review-bot: {event.get('message', '')}", file=sys.stderr)
+                    elif etype == "result":
+                        result = event
+                        break
+                    # unknown event types are ignored (forward compatibility)
+        except OSError:
+            pass
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     if result is None:
-        die("the review-bot service closed the connection without a result — check its journal (journalctl -u 'review-bot-review@*')")
+        die(CONNECTION_LOST)
     if not result.get("ok"):
         die(result.get("error") or "review failed (service reported no error detail)")
     # Mirror the old CLI's stdout: markdown when --print-only, else the posted URL.
