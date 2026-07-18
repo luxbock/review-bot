@@ -473,6 +473,12 @@ def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None, expected_he
                 )
                 time.sleep(backoff)
         if expected_head and got != expected_head:
+            # die() fires before add_worktree/Checkout, so Checkout.__exit__'s ref
+            # cleanup (see 418-420) never runs. Delete the per-run pull ref here to
+            # match that path — otherwise each abort leaks a ref that pins its
+            # fetched objects against GC, defeating _prune_run_refs.
+            with contextlib.suppress(Exception):
+                git(["update-ref", "-d", pr_ref], cwd=cdir, auth=auth, check=False)
             die(
                 f"PR #{pr} head {got[:12]} != forge head {expected_head[:12]} after "
                 f"{HEAD_SYNC_RETRIES + 1} refetches — pull ref lagging the push; retry"

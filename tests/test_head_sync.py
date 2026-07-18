@@ -125,6 +125,17 @@ class HeadSyncTest(unittest.TestCase):
         wt_root = os.path.join(cdir, ".wt")
         leftover = os.listdir(wt_root) if os.path.isdir(wt_root) else []
         self.assertEqual(leftover, [], f".wt/ leaked a worktree after aborting: {leftover}")
+        # And the per-run pull ref must be gone too — otherwise it pins the fetched
+        # objects against GC, and sweep_stale_worktrees can't reap it (there's no
+        # .wt/ dir to key off of). Regression guard for the abort-path ref leak.
+        leftover_refs = run_git(
+            ["for-each-ref", "--format=%(refname)", "refs/review-bot/wt-*/*"],
+            cwd=cdir,
+        ).stdout.strip().splitlines()
+        self.assertEqual(
+            leftover_refs, [],
+            f"per-run pull ref leaked after aborting: {leftover_refs}",
+        )
 
     # ── 2. Stale then converges → succeeds at the right head. ──────────────────
     def test_stale_then_converges_lands_on_new_head(self):
