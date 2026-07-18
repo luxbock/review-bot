@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from typing import NoReturn
@@ -82,6 +83,14 @@ ENGINE_TIMEOUT = int(os.environ.get("REVIEW_BOT_ENGINE_TIMEOUT", "1800"))
 # real multi-engine run (ENGINE_TIMEOUT is 30min per engine).
 WT_STALE_SECS = int(os.environ.get("REVIEW_BOT_WT_STALE_SECS", "21600"))
 DIFF_INLINE_CAP = int(os.environ.get("REVIEW_BOT_DIFF_CAP", "60000"))
+# Forgejo populates refs/pull/N/head asynchronously after a branch push, so a review
+# fired seconds later can fetch the pre-push commit. prepare_checkout re-fetches the
+# pull ref with bounded exponential backoff until it matches meta["head"]["sha"];
+# default 4 retries at 1s base ≈ 1+2+4+8 ≈ 15s total, comfortably above the observed
+# sub-second-to-seconds propagation window. Both are env-overridable so a test can
+# set retries to 0 for a deterministic single-shot failure.
+HEAD_SYNC_RETRIES = int(os.environ.get("REVIEW_BOT_HEAD_SYNC_RETRIES", "4"))
+HEAD_SYNC_BASE_SECS = float(os.environ.get("REVIEW_BOT_HEAD_SYNC_BASE_SECS", "1.0"))
 
 # The harness commands are env-overridable because the exact CLI flags for headless
 # review (esp. tool-permission flags) may need tuning against the live engines —
@@ -412,10 +421,19 @@ class Checkout:
         return False
 
 
-def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None):
+def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None, expected_head=None):
     """Fetch the PR head + base into the shared cache, carve a PRIVATE detached worktree
     at the PR head, and return (Checkout, merge_base). The returned Checkout MUST be used
-    as a context manager (or have __exit__ called) so its worktree is cleaned up."""
+    as a context manager (or have __exit__ called) so its worktree is cleaned up.
+
+    When ``expected_head`` is set (the serve/PR path passes ``meta["head"]["sha"]``),
+    the fetched ``refs/pull/{pr}/head`` is verified against it: Forgejo populates the
+    pull ref asynchronously after a push, so a fetch fired seconds later can land on
+    the pre-push commit. On mismatch, re-fetch with bounded exponential backoff; if
+    the pull ref never converges, ``die()`` with a distinct message rather than review
+    a stale tree. When ``expected_head`` is ``None`` (the ``--repo-dir`` path and any
+    other caller — e.g. issue-triage never passes it), the check is skipped entirely.
+    """
     cdir = ensure_clone(owner, repo, auth, repo_dir)
     if repo_dir:
         # --repo-dir is the caller's own checkout: keep the legacy in-place behaviour
@@ -435,7 +453,36 @@ def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None):
     sweep_stale_worktrees(cdir, auth)
     with _shared_store_lock(_repo_lock_path(owner, repo)):
         git(["fetch", "--quiet", "origin", f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"], cwd=cdir, auth=auth)
-        git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{pr_ref}"], cwd=cdir, auth=auth)
+        # Fetch the pull ref, then verify it against the API-reported head. Retries
+        # are budget-bounded and *internal*: a persistent mismatch surfaces via die()
+        # → ok=false result event, distinct from the #17 client-side busy/exit-75
+        # channel. The retry budget covers Forgejo's ref-propagation lag; we do NOT
+        # rebuild the merge_base until the head has converged.
+        got = None
+        for attempt in range(HEAD_SYNC_RETRIES + 1):
+            git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{pr_ref}"], cwd=cdir, auth=auth)
+            got = git(["rev-parse", pr_ref], cwd=cdir, auth=auth).stdout.strip()
+            if not expected_head or got == expected_head:
+                break
+            if attempt < HEAD_SYNC_RETRIES:
+                backoff = HEAD_SYNC_BASE_SECS * (2 ** attempt)
+                log(
+                    f"PR #{pr} pull ref at {got[:12]} != forge head {expected_head[:12]} "
+                    f"(attempt {attempt + 1}/{HEAD_SYNC_RETRIES + 1}); "
+                    f"sleeping {backoff:.1f}s for propagation"
+                )
+                time.sleep(backoff)
+        if expected_head and got != expected_head:
+            # die() fires before add_worktree/Checkout, so Checkout.__exit__'s ref
+            # cleanup (see 418-420) never runs. Delete the per-run pull ref here to
+            # match that path — otherwise each abort leaks a ref that pins its
+            # fetched objects against GC, defeating _prune_run_refs.
+            with contextlib.suppress(Exception):
+                git(["update-ref", "-d", pr_ref], cwd=cdir, auth=auth, check=False)
+            die(
+                f"PR #{pr} head {got[:12]} != forge head {expected_head[:12]} after "
+                f"{HEAD_SYNC_RETRIES + 1} refetches — pull ref lagging the push; retry"
+            )
         mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", pr_ref], cwd=cdir, auth=auth)
         merge_base = mb.stdout.strip()
         wt = add_worktree(cdir, runid, pr_ref, auth)
@@ -974,7 +1021,13 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     if meta.get("merged"):
         log("note: PR is already merged — reviewing anyway")
     base_ref = meta["base"]["ref"]
-    checkout, merge_base = prepare_checkout(args.owner, args.repo, args.pr, base_ref, auth, args.repo_dir or None)
+    # Guard against a malformed API response: a missing/empty head.sha degrades to
+    # today's no-check behaviour rather than hard-failing every review.
+    expected_head = (meta.get("head") or {}).get("sha") or None
+    checkout, merge_base = prepare_checkout(
+        args.owner, args.repo, args.pr, base_ref, auth, args.repo_dir or None,
+        expected_head=expected_head,
+    )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd
         diff_block = changed_files_block(cdir, merge_base, auth)
