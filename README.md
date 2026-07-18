@@ -44,9 +44,17 @@ serve/client split inverts that:
 - `review-bot-serve` runs as a systemd **socket-activated service**
   (`Accept=yes`, inetd-style: one connection = one unit instance with
   stdin/stdout wired to the socket) under a dedicated user that owns the
-  credentials. `MaxConnections=1` serializes requests in the listen backlog,
-  which also prevents concurrent runs from fighting over the shared cache
-  clone (issue #1).
+  credentials. The socket unit's `MaxConnections=N` (default `N=4`) bounds
+  how many client connections systemd accepts in parallel — each spawning a
+  fresh `review-bot-serve` instance. Reviews themselves are still **serialized
+  one at a time** by a process-wide exclusive `fcntl.flock` on
+  `$REVIEW_BOT_LOCK_FILE` (default `~/review-serve.lock`) that every serve
+  instance takes around the review pipeline; the second-and-later instance
+  emits a `{"type":"log","message":"queued: …"}` progress line and blocks
+  until it is its turn (issue #17). This lock is distinct from review.py's
+  per-repo `{owner}__{repo}.lock` (issue #1). Serialization is required
+  because both engines share the service's OAuth refresh-token store and
+  concurrent runs would invalidate each other's credentials.
 - `review-bot-review` (the binary on caller PATHs) is now a thin client: same
   argv as before, so `poll.py` and every other caller migrate by doing
   nothing. It serializes the flags to a one-line JSON request, sends it over
@@ -54,6 +62,17 @@ serve/client split inverts that:
   `/run/review-bot/review.sock`), streams the response, and prints the
   markdown (`--print-only`) or posted comment URL exactly as before,
   exiting 0/1. Callers never see a credential.
+
+  A request **beyond** `MaxConnections=N` is refused by systemd — zero
+  NDJSON events reach the client. The client distinguishes this *busy-drop*
+  from a genuine mid-review connection loss by tracking whether any event
+  was received: **zero events** ⇒ busy, retried automatically with bounded
+  exponential backoff (base 1s, factor 2, cap 30s, count
+  `REVIEW_BOT_BUSY_RETRIES`, default `6`); if still busy after the budget
+  the client exits **75** (`EX_TEMPFAIL`) with a truthful busy message,
+  never the misleading `connection was lost` text. **≥1 event** ⇒ genuine
+  loss: exits 1 with `connection was lost` and the outcome-unknown
+  guidance, exactly as before.
 - `review-bot-review-local` is the old direct-execution path — it requires
   local credentials and is what the service itself runs (as an import).
 

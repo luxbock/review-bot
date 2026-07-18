@@ -3,3 +3,5 @@ __pycache__/
 
 # Factory run scaffolding — ephemeral BRIEF/RESULT/etc., never shipped
 /.factory/
+# Claude Code session scaffolding — same story
+/.claude/
