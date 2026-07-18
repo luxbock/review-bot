@@ -204,30 +204,22 @@ class ServeFlockContentionTest(unittest.TestCase):
         "dry_run": False,
     }
 
-    @staticmethod
-    def _read_all_events(sock):
-        sock.settimeout(15)
-        data = b""
-        while True:
-            try:
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                raise AssertionError(f"serve process did not close socket in time; got {data!r}")
-            if not chunk:
-                break
-            data += chunk
-        return [json.loads(l) for l in data.decode().splitlines() if l.strip()]
-
     def test_two_processes_serialize_and_second_emits_queued(self):
         with tempfile.TemporaryDirectory(prefix="rb-flock-test-") as tmp:
             review_impl = os.path.join(tmp, "fake_review.py")
             lock_file = os.path.join(tmp, "serve.lock")
             marker = os.path.join(tmp, "marker.txt")
+            gate = os.path.join(tmp, "release.gate")
 
-            # Fake review.py: writes start-/end-<pid> around a 0.3s sleep, all
-            # inside the pipeline (i.e. under serve.py's flock). If the flock
-            # holds, the marker sequence is well-nested; if it doesn't, we see
-            # interleaved start-B before end-A.
+            # Fake review.py: writes start-/end-<pid> around a wait for a gate
+            # file that the test only creates after observing B's `queued`
+            # event. This is positive synchronization — A holds the flock
+            # until B has demonstrably reached fcntl.flock(LOCK_EX|LOCK_NB)
+            # and hit BlockingIOError, replacing an earlier fixed sleep whose
+            # slack could be eaten by B's Python-startup latency under load.
+            # B's _work() sees GATE already present and does not wait, so the
+            # marker sequence is still well-nested: start-A, end-A, start-B,
+            # end-B. Any interleaving would prove the flock did not serialize.
             with open(review_impl, "w", encoding="utf-8") as f:
                 f.write(
                     "import os, time\n"
@@ -237,12 +229,15 @@ class ServeFlockContentionTest(unittest.TestCase):
                     "    def __init__(self, token): pass\n"
                     "    def cleanup(self): pass\n"
                     f"MARKER = {marker!r}\n"
+                    f"GATE = {gate!r}\n"
                     "def _work():\n"
                     "    pid = os.getpid()\n"
                     "    with open(MARKER, 'a', encoding='utf-8') as mf:\n"
                     "        mf.write(f'start-{pid}\\n')\n"
                     "        mf.flush()\n"
-                    "    time.sleep(0.3)\n"
+                    "    deadline = time.monotonic() + 30\n"
+                    "    while not os.path.exists(GATE) and time.monotonic() < deadline:\n"
+                    "        time.sleep(0.005)\n"
                     "    with open(MARKER, 'a', encoding='utf-8') as mf:\n"
                     "        mf.write(f'end-{pid}\\n')\n"
                     "        mf.flush()\n"
@@ -284,6 +279,13 @@ class ServeFlockContentionTest(unittest.TestCase):
                     time.sleep(0.01)
                 return False
 
+            def read_events(fileobj):
+                for line in fileobj:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    yield json.loads(line.decode())
+
             proc_a, sock_a = spawn()
             # Wait until A has actually entered the pipeline (grabbed the lock
             # + written its start marker). Without this, B could race in and
@@ -294,14 +296,52 @@ class ServeFlockContentionTest(unittest.TestCase):
             )
             proc_b, sock_b = spawn()
 
+            # Drive both sockets via line-buffered readers so we can observe
+            # B's `queued` event in real time while A still holds the flock,
+            # without having to wait for either process to close its socket.
+            sock_a.settimeout(30)
+            sock_b.settimeout(30)
+            file_a = sock_a.makefile("rb")
+            file_b = sock_b.makefile("rb")
+            b_stream = read_events(file_b)
+            events_b = []
+            saw_queued = False
+
             try:
-                events_a = self._read_all_events(sock_a)
-                events_b = self._read_all_events(sock_b)
+                # Read B's stream until we see the `queued` log — that
+                # positively proves B reached fcntl.flock(LOCK_EX|LOCK_NB)
+                # and hit BlockingIOError while A was still holding the
+                # lock. Only then do we release A.
+                try:
+                    for ev in b_stream:
+                        events_b.append(ev)
+                        if ev.get("type") == "log" and "queued" in ev.get("message", ""):
+                            saw_queued = True
+                            break
+                except (socket.timeout, TimeoutError):
+                    pass
+
+                # Release A regardless of the outcome above; leaving A
+                # hanging on the gate would just extend the test timeout.
+                with open(gate, "w"):
+                    pass
+
+                self.assertTrue(
+                    saw_queued,
+                    f"B did not emit the queued log; got {events_b!r}",
+                )
+
+                # Drain the rest: A ends first, then B acquires the flock,
+                # sees GATE already present, runs, and ends.
+                events_a = list(read_events(file_a))
+                events_b.extend(b_stream)
                 rc_a = proc_a.wait(timeout=15)
                 rc_b = proc_b.wait(timeout=15)
                 stderr_a = proc_a.stderr.read().decode()
                 stderr_b = proc_b.stderr.read().decode()
             finally:
+                file_a.close()
+                file_b.close()
                 proc_a.stderr.close()
                 proc_b.stderr.close()
                 sock_a.close()
