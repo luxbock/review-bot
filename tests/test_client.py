@@ -23,6 +23,10 @@ LOST = (
     "the review outcome is unknown and may already have posted; inspect the target "
     "or service journal before retrying\n"
 )
+BUSY = (
+    "review-bot-review: error: review-bot service busy — a review is already "
+    "in flight; retry later\n"
+)
 
 
 def read_request(conn):
@@ -86,16 +90,22 @@ class FakeUnixPeer:
 class ClientTest(unittest.TestCase):
     maxDiff = None
 
-    def run_client(self, handler, *extra_args):
+    def run_client(self, handler, *extra_args, env_overrides=None):
         peer = FakeUnixPeer(handler)
         env = dict(os.environ, REVIEW_BOT_SOCKET=peer.path)
+        # Default off so a zero-event drop does not sleep-then-retry through the
+        # 5s subprocess timeout. Individual tests that care about the loop
+        # override this explicitly.
+        env.setdefault("REVIEW_BOT_BUSY_RETRIES", "0")
+        if env_overrides:
+            env.update(env_overrides)
         try:
             proc = subprocess.run(
                 [sys.executable, CLIENT, *CLIENT_ARGS, *extra_args],
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=10,
             )
         finally:
             peer.finish()
@@ -165,11 +175,16 @@ client.main()
             "login/session or any long-running user manager\n",
         )
 
-    def test_reset_before_response_is_unknown(self):
+    def test_reset_before_any_event_is_busy_drop(self):
+        # Peer accepts then RSTs with zero bytes — the serve process never
+        # started emitting, so this is systemd refusing past MaxConnections
+        # (issue #17 semantics), not a genuine mid-review loss. With
+        # REVIEW_BOT_BUSY_RETRIES=0 (default in run_client) the client fails
+        # once with the truthful busy signal and exit 75.
         def handler(conn):
             reset_peer(conn)
 
-        self.assert_process(self.run_client(handler), 1, "", LOST)
+        self.assert_process(self.run_client(handler), 75, "", BUSY)
 
     def test_log_then_reset_preserves_log_and_reports_unknown(self):
         def handler(conn):
@@ -207,11 +222,13 @@ client.main()
             "review-bot-review: error: engine failed\n",
         )
 
-    def test_clean_eof_without_result_is_unknown(self):
+    def test_clean_eof_without_any_event_is_busy_drop(self):
+        # Peer reads the request, then closes cleanly with no bytes emitted.
+        # Same shape as the reset case: zero events ⇒ busy-drop, exit 75.
         def handler(conn):
             read_request(conn)
 
-        self.assert_process(self.run_client(handler), 1, "", LOST)
+        self.assert_process(self.run_client(handler), 75, "", BUSY)
 
     def test_clean_success_prints_markdown(self):
         def handler(conn):
