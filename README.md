@@ -22,7 +22,14 @@ Three modes, sharing all the identity/git/engine/post plumbing:
   it links it (`Supersedes #N`) rather than closing it.
 
 - `review.py` → `review-bot-review-local` — the in-process reviewer/triager
-  (engine-agnostic); also the module `review-bot-serve` imports.
+  (engine-agnostic); also the module `review-bot-serve` imports. When reviewing
+  a PR it fetches `refs/pull/N/head` and verifies the checked-out SHA equals
+  the API's `meta["head"]["sha"]` — Forgejo populates the pull ref
+  **asynchronously** after a push, so a review fired seconds later can
+  otherwise land on the pre-push commit. Bounded exponential backoff
+  (`REVIEW_BOT_HEAD_SYNC_RETRIES`, `REVIEW_BOT_HEAD_SYNC_BASE_SECS`) absorbs
+  the propagation lag; a persistent mismatch aborts with a distinct error
+  rather than review a stale tree (issue #16).
 - `serve.py`  → `review-bot-serve`  — inetd-style service entry point (see
   *Serve / client mode* below).
 - `client.py` → `review-bot-review` — the credential-free client callers use.
