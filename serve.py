@@ -35,6 +35,7 @@ An invalid request still gets a result event (ok=false) and a nonzero exit.
 
 import argparse
 import contextlib
+import fcntl
 import importlib.util
 import json
 import os
@@ -51,6 +52,13 @@ REVIEW_IMPL = "@REVIEW_IMPL@"  # the installed (substituted) review.py module
 MAX_REQUEST_BYTES = 64 * 1024
 # Env-overridable (from the trusted unit environment) mainly so tests can shrink it.
 READ_TIMEOUT = float(os.environ.get("REVIEW_BOT_READ_TIMEOUT", "30"))
+# Serve-level exclusive lock: `MaxConnections=N` in the socket unit lets systemd
+# accept up to N connections in parallel, but the engines can't run concurrently
+# (rotating single-use OAuth refresh tokens shared through one credential dir).
+# This flock serialises the review pipeline across ALL live serve instances so
+# a queued waiter blocks in-process instead of being dropped. Distinct from
+# review.py's per-repo `{owner}__{repo}.lock` — this is one global serve lock.
+DEFAULT_LOCK_FILE = os.path.join(os.path.expanduser("~") or "/tmp", "review-serve.lock")
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 HARNESSES = ("claude", "codex")
@@ -229,6 +237,25 @@ def _die_to_exception(msg, code=1):
     raise ReviewFailure(str(msg))
 
 
+def _acquire_pipeline_lock(proto):
+    """Take the process-wide exclusive lock around the review pipeline.
+
+    Path is `$REVIEW_BOT_LOCK_FILE` (default `~/review-serve.lock`). If another
+    serve instance already holds it, emit a `queued` log event so the client
+    can distinguish `waiting for a slot` from `dropped past MaxConnections`,
+    then block on `LOCK_EX`. The caller must close the returned fd in a
+    `finally` block; that releases the flock.
+    """
+    path = os.environ.get("REVIEW_BOT_LOCK_FILE", DEFAULT_LOCK_FILE)
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        emit(proto, {"type": "log", "message": "queued: waiting for the in-flight review to finish"})
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
 def main():
     proto = sys.stdout  # the protocol channel — nothing else may write here
     log_peercred()
@@ -257,6 +284,12 @@ def main():
         },
     )
 
+    # Acquire the serve-level pipeline lock. The initial log above already
+    # reached the client, so a client that eventually sees ≥1 event knows the
+    # pipeline was accepted (queued, not busy-dropped). This happens AFTER the
+    # READ_TIMEOUT-bounded request read, so a long queue wait does not trip
+    # that timeout.
+    lock_fh = _acquire_pipeline_lock(proto)
     ok, markdown, url, error = False, None, None, None
     auth = None
     try:
@@ -283,6 +316,14 @@ def main():
     finally:
         if auth is not None:
             auth.cleanup()
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            lock_fh.close()
+        except OSError:
+            pass
 
     emit(proto, {"type": "result", "ok": ok, "markdown": markdown, "url": url, "error": error})
     sys.exit(0 if ok else 1)
