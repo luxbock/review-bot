@@ -343,8 +343,12 @@ mode = "file-list" if cap == "1" else "inlined"
 chars = os.environ.get("FINDER_AB_TEST_DIFF_CHARS", "4096")
 if chars == "0":
     mode = "inlined"  # 0 <= any cap — the masquerade the harness must refuse
+# Reports a cap the harness did NOT force, standing in for the socket client, which
+# drops REVIEW_BOT_DIFF_CAP and runs at the service default while still relaying a
+# well-formed journal line.
+reported_cap = os.environ.get("FINDER_AB_TEST_REPORT_CAP", cap or "60000")
 sys.stderr.write(
-    "review-bot-review: diff " + chars + " chars vs cap " + (cap or "60000")
+    "review-bot-review: diff " + chars + " chars vs cap " + reported_cap
     + " — " + ("inlined" if mode == "inlined" else "file-list only") + "\n"
 )
 print("## \U0001f916 review-bot — " + verdict)
@@ -497,8 +501,10 @@ def test_finder_ab_aborts_when_head_moves():
 def test_finder_ab_refuses_a_vacuous_zero_char_diff():
     """The failure this harness shipped with: a 0-char diff satisfies `0 <= cap`, so the
     footer says `inlined` even in the forced-elide cells, every cell reports zero findings,
-    and the run LOOKS like a clean result. Observed live against a merged PR, where the
-    live-computed merge base collapses to the head. It must abort, not tabulate."""
+    and the run LOOKS like a clean result. Originally observed live against a merged PR,
+    back when the merge base was always computed live and collapsed to the head; #26 fixed
+    that cause, but the guard still matters for a genuinely empty PR or a live fallback.
+    It must abort, not tabulate."""
     with scratch_dir() as tmp:
         stub, _log = make_stub_binary(tmp)
         os.environ.pop("FINDER_AB_TEST_EXIT", None)
@@ -549,6 +555,42 @@ def test_finder_ab_records_measured_diff_size():
     print("ok  9. finder_ab: the measured diff size and the cap actually applied are recorded")
 
 
+def test_finder_ab_refuses_a_cap_that_did_not_take():
+    """The symmetric masquerade to the 0-char one: the reviewer applied a cap the harness
+    did not force, so every cell shares one input mode and the matching means read as the
+    experiment's conclusion instead of as a broken instrument. The classic trigger is
+    --binary pointed at review-bot-review, the socket CLIENT, which accepts the identical
+    argv but drops REVIEW_BOT_DIFF_CAP (serve.py honours only its own env) while still
+    relaying a journal line that parses. It must abort, not tabulate."""
+    with scratch_dir() as tmp:
+        stub, _log = make_stub_binary(tmp)
+        os.environ.pop("FINDER_AB_TEST_EXIT", None)
+        os.environ["FINDER_AB_TEST_REPORT_CAP"] = "60000"  # the service default, not ours
+        out = os.path.join(tmp, "finder-ab.jsonl")
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                fresh_finder_ab().main([
+                    "--owner", "acme", "--repo", "widget", "--pr", "7",
+                    "--runs", "2", "--binary", stub, "--out", out,
+                ])
+        except SystemExit as e:
+            code = e.code
+        else:
+            raise AssertionError("a cap that did not take must abort rather than tabulate")
+        finally:
+            os.environ.pop("FINDER_AB_TEST_REPORT_CAP", None)
+        records = read_jsonl(out)
+    assert code == 1
+    msg = err.getvalue()
+    assert "did not reach the binary" in msg, msg
+    assert "review-bot-review-local" in msg, msg
+    # The run that exposed it is still recorded — aborting must not discard evidence.
+    assert len(records) == 1, records
+    assert records[0]["diff_cap_observed"] == 60000, records[0]
+    print("ok 10. finder_ab: a forced cap that never reached the reviewer aborts")
+
+
 def main():
     tests = [
         test_cap_boundary_is_exact,
@@ -560,6 +602,7 @@ def main():
         test_finder_ab_aborts_when_head_moves,
         test_finder_ab_refuses_a_vacuous_zero_char_diff,
         test_finder_ab_records_measured_diff_size,
+        test_finder_ab_refuses_a_cap_that_did_not_take,
     ]
     for test in tests:
         test()

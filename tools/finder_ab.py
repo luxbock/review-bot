@@ -336,9 +336,33 @@ def main(argv=None):
                             f"{args.owner}/{args.repo}#{args.pr} has a 0-char diff against its "
                             f"merge base, so there is nothing to review and every cell would be "
                             f"vacuously empty (a 0-char diff reports `inlined` under any cap). "
-                            f"The usual cause is a MERGED PR: review.py computes the merge base "
-                            f"live, and once the branch is in the base branch that collapses to "
-                            f"the head itself. Target a PR whose branch is not yet merged. "
+                            f"Since #26, review.py prefers the forge-recorded merge base, so a "
+                            f"MERGED PR normally still yields its original diff — target one "
+                            f"whose diff against its merge base is non-empty. A 0-char diff now "
+                            f"means either the PR really changes nothing, or the recorded base "
+                            f"was unusable and the live fallback collapsed to the head; "
+                            f"review.py's `merge base … (computed live — <reason>)` journal line "
+                            f"says which. ({len(records)} run(s) written to {args.out}.)"
+                        )
+                    # The symmetric masquerade: the cap never reached the reviewer, so every
+                    # cell ran at the SAME input mode and the table shows matching means —
+                    # which reads as the experiment's headline conclusion ("input mode does
+                    # not change finder yield") when it is really a broken instrument. The
+                    # classic trigger is --binary pointing at review-bot-review, the socket
+                    # CLIENT: it accepts the identical argv, but serve.py whitelists request
+                    # fields and honours only the service's own env, so REVIEW_BOT_DIFF_CAP is
+                    # dropped — and the client relays log events to stderr, so the records
+                    # still parse and still look healthy.
+                    if (
+                        record["diff_cap_observed"] is not None
+                        and record["diff_cap_observed"] != cap
+                    ):
+                        die(
+                            f"forced REVIEW_BOT_DIFF_CAP={cap} but the reviewer applied "
+                            f"{record['diff_cap_observed']} — the cap did not reach the binary, "
+                            f"so the cells would be identical by construction. Is --binary "
+                            f"pointing at review-bot-review (the socket client) instead of "
+                            f"review-bot-review-local? "
                             f"({len(records)} run(s) written to {args.out}.)"
                         )
                     if record["aborted"]:

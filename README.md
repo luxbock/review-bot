@@ -115,14 +115,26 @@ instead of mixing two diffs into one cell. The summary table has one row per
 cell with the run count, aborted count, number of empty drafts, and the mean
 draft and surviving finding counts.
 
-**Target a PR that is not yet merged.** `review.py` computes the merge base
-live, so once a branch is merged into its base that merge base collapses to the
-head itself and the diff is empty. An empty diff satisfies `0 <= cap`, which
-makes the footer report `inlined` even in the forced-elide cells and every cell
-report zero findings — a null experiment that *looks* like a clean result. The
-harness therefore refuses a 0-char diff outright rather than tabulating it, and
-the recorded diff size is what distinguishes "the cap did not take" from "there
-was nothing to review".
+**Target a PR whose diff against its merge base is non-empty.** Since #26
+`review.py` prefers the forge-recorded merge base, so a *merged* PR normally
+still yields its original diff — merged PRs are in fact the better subjects,
+since their heads are frozen and the runs are reproducible. A 0-char diff now
+means either the PR really changes nothing, or the recorded base was unusable
+and the live fallback collapsed to the head; `review.py`'s
+`merge base … (computed live — <reason>)` journal line says which.
+
+An empty diff satisfies `0 <= cap`, which makes the footer report `inlined` even
+in the forced-elide cells and every cell report zero findings — a null
+experiment that *looks* like a clean result. The harness therefore refuses a
+0-char diff outright rather than tabulating it, and the recorded diff size is
+what distinguishes "the cap did not take" from "there was nothing to review".
+
+The harness refuses the symmetric masquerade too: if the cap the reviewer
+actually applied differs from the one forced, the run aborts. Otherwise every
+cell would share one input mode and the matching means would read as the
+experiment's conclusion rather than as a broken instrument — the usual cause
+being `--binary` pointed at `review-bot-review`, the socket client, which
+silently drops `REVIEW_BOT_DIFF_CAP`.
 
 ## Serve / client mode
 
