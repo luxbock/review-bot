@@ -1139,10 +1139,13 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     # Guard against a malformed API response: a missing/empty head.sha degrades to
     # today's no-check behaviour rather than hard-failing every review.
     expected_head = (meta.get("head") or {}).get("sha") or None
+    checkout_kwargs = {"expected_head": expected_head}
+    recorded_merge_base = meta.get("merge_base")
+    if recorded_merge_base is not None:
+        checkout_kwargs["recorded_merge_base"] = recorded_merge_base
     checkout, merge_base = prepare_checkout(
         args.owner, args.repo, args.pr, base_ref, auth, args.repo_dir or None,
-        expected_head=expected_head,
-        recorded_merge_base=meta.get("merge_base"),
+        **checkout_kwargs,
     )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd
