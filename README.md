@@ -41,6 +41,22 @@ Three modes, sharing all the identity/git/engine/post plumbing:
 - `default.nix` — `callPackage`-able derivation (deps: `python3`, `git`;
   `claude`/`codex` resolved from PATH at runtime).
 
+## Review output
+
+At `standard` and `deep` depth, each usable finder draft normally goes through
+verification. A zero-finding PR or repo draft skips that no-op engine call and
+stays green, but the PR review makes the stage provenance explicit immediately
+after its confidence-bar sentence:
+
+> ⚠️ The finder stage returned no findings, so nothing was verified — this reports an empty finder, not a verified-clean diff.
+
+If verification instead checks a non-empty draft and removes every finding, the
+review says `All N draft finding(s) were checked and dropped by the verification stage.`
+Review and audit footers also include a `findings` segment directly after the `bar`
+segment, with each generator harness's draft and surviving counts in pipeline
+order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
+`synthesized` suffix appears when the multi-harness synthesis stage ran.
+
 ## Serve / client mode
 
 Running the pipeline in-process means the calling user must hold the forge
