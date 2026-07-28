@@ -492,15 +492,26 @@ def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None, expected_he
 
 
 def changed_files_block(cdir, merge_base, auth):
+    """Return (block, inlined) — the review prompt's diff input plus the flag saying
+    whether the FULL diff was inlined or only the file list was.
+
+    The flag is returned rather than re-derived by the caller on purpose (issue #21):
+    the size comparison exists in exactly one place, so the journal line and the review
+    footer can never disagree with the input the engine actually saw.
+    """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
-    if len(diff) <= DIFF_INLINE_CAP:
-        return f"{stat}\n```diff\n{diff}\n```"
+    inlined = len(diff) <= DIFF_INLINE_CAP
+    log(f"diff {len(diff)} chars vs cap {DIFF_INLINE_CAP} — "
+        f"{'inlined' if inlined else 'file-list only'}")
+    if inlined:
+        return f"{stat}\n```diff\n{diff}\n```", True
     return (
         f"{stat}\n\n(diff is large — only the file list is inlined. The repo is checked "
         f"out at the PR head; run `git diff {merge_base[:12]}..HEAD -- <file>` to inspect "
-        f"specific hunks.)"
+        f"specific hunks.)",
+        False,
     )
 
 
@@ -862,7 +873,7 @@ def append_clean_review_provenance(out, provenance):
         ]
 
 
-def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None):
+def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, diff_inlined=None):
     verdict = review["verdict"]
     findings = review["findings"]
     findings.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
@@ -888,10 +899,16 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None):
     hlabel = ",".join(harnesses)
     counts = provenance_counts(provenance)
     findings_segment = f" · findings `{counts}`" if counts else ""
+    # diff_inlined comes straight from changed_files_block's own comparison (issue #21),
+    # so the disclosed input mode is the one the finder actually got. None (no caller
+    # information, e.g. a direct render in a test) simply omits the segment.
+    diff_segment = ""
+    if diff_inlined is not None:
+        diff_segment = f" · diff `{'inlined' if diff_inlined else 'file-list'}`"
     out += [
         "---",
         f"*Automated review by **review-bot** · harness `{hlabel}` · depth `{depth}` · "
-        f"bar `{bar}`{findings_segment} · merge-base `{merge_base[:12]}`. "
+        f"bar `{bar}`{findings_segment}{diff_segment} · merge-base `{merge_base[:12]}`. "
         f"Advisory only — olli merges. "
         f"Re-run with `@review-bot <args>` (e.g. `@review-bot deep with claude,codex`).*",
     ]
@@ -1089,7 +1106,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd
-        diff_block = changed_files_block(cdir, merge_base, auth)
+        diff_block, diff_inlined = changed_files_block(cdir, merge_base, auth)
         conv = convention_files(cdir)
         conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
 
@@ -1127,7 +1144,8 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
             harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "pr"
         )
         markdown = render_markdown(
-            final, harnesses, args.depth, bar, merge_base, provenance=provenance
+            final, harnesses, args.depth, bar, merge_base, provenance=provenance,
+            diff_inlined=diff_inlined,
         )
         return post_or_print(args, token, markdown, "review")
 
