@@ -546,6 +546,11 @@ def changed_files_block(cdir, merge_base, auth):
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
+    if not diff:
+        die(
+            f"empty diff at merge base {merge_base[:12]} — nothing to review; "
+            "refusing to render a vacuous pass"
+        )
     if len(diff) <= DIFF_INLINE_CAP:
         return f"{stat}\n```diff\n{diff}\n```"
     return (
