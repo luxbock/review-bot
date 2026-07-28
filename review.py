@@ -421,7 +421,55 @@ class Checkout:
         return False
 
 
-def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None, expected_head=None):
+def _select_merge_base(cdir, base_ref, head_ref, auth, recorded_merge_base=None):
+    """Prefer a usable forge-recorded merge base, otherwise compute one live."""
+    recorded = (recorded_merge_base or "").strip()
+    if not recorded:
+        fallback_reason = "forge merge_base absent"
+    elif git(
+        ["cat-file", "-e", f"{recorded}^{{commit}}"],
+        cwd=cdir,
+        auth=auth,
+        check=False,
+    ).returncode != 0:
+        fallback_reason = f"forge merge_base {recorded[:12]} unknown locally"
+    elif git(
+        ["merge-base", "--is-ancestor", recorded, head_ref],
+        cwd=cdir,
+        auth=auth,
+        check=False,
+    ).returncode != 0:
+        head = git(["rev-parse", head_ref], cwd=cdir, auth=auth).stdout.strip()
+        fallback_reason = (
+            f"forge merge_base {recorded[:12]} not an ancestor of head {head[:12]}"
+        )
+    else:
+        merge_base = git(
+            ["rev-parse", f"{recorded}^{{commit}}"], cwd=cdir, auth=auth
+        ).stdout.strip()
+        log(f"merge base {merge_base[:12]} (forge-recorded)")
+        return merge_base
+
+    merge_base = git(
+        ["merge-base", f"refs/remotes/origin/{base_ref}", head_ref],
+        cwd=cdir,
+        auth=auth,
+    ).stdout.strip()
+    log(f"merge base {merge_base[:12]} (computed live — {fallback_reason})")
+    return merge_base
+
+
+def prepare_checkout(
+    owner,
+    repo,
+    pr,
+    base_ref,
+    auth,
+    repo_dir=None,
+    expected_head=None,
+    *,
+    recorded_merge_base=None,
+):
     """Fetch the PR head + base into the shared cache, carve a PRIVATE detached worktree
     at the PR head, and return (Checkout, merge_base). The returned Checkout MUST be used
     as a context manager (or have __exit__ called) so its worktree is cleaned up.
@@ -439,10 +487,12 @@ def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None, expected_he
         # --repo-dir is the caller's own checkout: keep the legacy in-place behaviour
         # (no private worktree, no cleanup). Concurrency here is the caller's problem.
         git(["fetch", "--quiet", "origin", f"+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"], cwd=cdir, auth=auth)
-        git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
-        mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", f"refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
-        merge_base = mb.stdout.strip()
-        git(["checkout", "--quiet", "--detach", f"refs/review-bot/pr-{pr}"], cwd=cdir, auth=auth)
+        head_ref = f"refs/review-bot/pr-{pr}"
+        git(["fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{head_ref}"], cwd=cdir, auth=auth)
+        merge_base = _select_merge_base(
+            cdir, base_ref, head_ref, auth, recorded_merge_base
+        )
+        git(["checkout", "--quiet", "--detach", head_ref], cwd=cdir, auth=auth)
         co = Checkout(None, cdir, None)
         co.auth = auth
         return co, merge_base
@@ -483,8 +533,9 @@ def prepare_checkout(owner, repo, pr, base_ref, auth, repo_dir=None, expected_he
                 f"PR #{pr} head {got[:12]} != forge head {expected_head[:12]} after "
                 f"{HEAD_SYNC_RETRIES + 1} refetches — pull ref lagging the push; retry"
             )
-        mb = git(["merge-base", f"refs/remotes/origin/{base_ref}", pr_ref], cwd=cdir, auth=auth)
-        merge_base = mb.stdout.strip()
+        merge_base = _select_merge_base(
+            cdir, base_ref, pr_ref, auth, recorded_merge_base
+        )
         wt = add_worktree(cdir, runid, pr_ref, auth)
     co = Checkout(cdir, wt, pr_ref)
     co.auth = auth
@@ -503,8 +554,18 @@ def changed_files_block(cdir, merge_base, auth):
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     inlined = len(diff) <= DIFF_INLINE_CAP
+    # The measurement is logged BEFORE the empty-diff refusal below, not after: a 0-char
+    # diff is exactly the case tools/finder_ab.py needs the number for, since `0 <= cap`
+    # holds under ANY cap and the inlined/file-list word alone cannot tell "the cap did
+    # not take" from "there was nothing to review". Dying first would leave the harness
+    # with no measurement at all. Nothing is rendered and no engine runs either way.
     log(f"diff {len(diff)} chars vs cap {DIFF_INLINE_CAP} — "
         f"{'inlined' if inlined else 'file-list only'}")
+    if not diff:
+        die(
+            f"empty diff at merge base {merge_base[:12]} — nothing to review; "
+            "refusing to render a vacuous pass"
+        )
     if inlined:
         return f"{stat}\n```diff\n{diff}\n```", True
     return (
@@ -1103,6 +1164,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     checkout, merge_base = prepare_checkout(
         args.owner, args.repo, args.pr, base_ref, auth, args.repo_dir or None,
         expected_head=expected_head,
+        recorded_merge_base=meta.get("merge_base"),
     )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd

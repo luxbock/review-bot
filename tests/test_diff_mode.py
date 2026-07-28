@@ -233,7 +233,8 @@ def render_pr_review(tmpdir, cap=None):
         "merged": False, "base": {"ref": "main"}, "head": {"sha": head},
     }
     review.prepare_checkout = (
-        lambda owner, repo, pr, base_ref, auth, repo_dir=None, expected_head=None: (checkout, base)
+        lambda owner, repo, pr, base_ref, auth, repo_dir=None, expected_head=None,
+        recorded_merge_base=None: (checkout, base)
     )
     err = io.StringIO()
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
