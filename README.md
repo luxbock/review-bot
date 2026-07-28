@@ -47,6 +47,8 @@ Three modes, sharing all the identity/git/engine/post plumbing:
 - `*-prompt.md` — the portable review / verify / synthesis / triage prompts.
 - `default.nix` — `callPackage`-able derivation (deps: `python3`, `git`;
   `claude`/`codex` resolved from PATH at runtime).
+- `tools/finder_ab.py` — operator instrument for the finder-stage A/B
+  experiment (see *Diff input mode* below). Deliberately **not** packaged.
 
 ## Review output
 
@@ -63,6 +65,76 @@ Review and audit footers also include a `findings` segment directly after the `b
 segment, with each generator harness's draft and surviving counts in pipeline
 order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
 `synthesized` suffix appears when the multi-harness synthesis stage ran.
+
+## Diff input mode
+
+A PR review feeds the finder either the **full diff** or, when the diff exceeds
+`REVIEW_BOT_DIFF_CAP` (default 60000 chars), only the **file list** plus the
+instruction to read the checked-out tree. Which one the finder got changes what
+it can find, so both are now disclosed rather than inferred:
+
+- a journal line, emitted before any engine runs —
+  `review-bot-review: diff 65525 chars vs cap 60000 — file-list only`
+  (the alternative wording is `— inlined`);
+- a review footer segment directly after `findings` and before `merge-base`:
+  ``diff `inlined` `` or ``diff `file-list` ``.
+
+Both come from the single `len(diff) <= REVIEW_BOT_DIFF_CAP` comparison
+`changed_files_block` already made — a diff of exactly the cap is inlined — so
+the disclosure can never drift from the input the engine actually saw. PR mode
+only: triage and audit footers are unchanged.
+
+### The A/B harness
+
+`tools/finder_ab.py` measures whether the input mode changes finder yield. It
+runs a full factorial over one PR — harness ∈ {`claude`, `codex`} × input mode ∈
+{forced-inline, forced-elide} × `--runs` (default 5) — at a fixed `--depth`
+(default `standard`) and `--confidence-bar` (default `medium`):
+
+```
+python3 tools/finder_ab.py --owner O --repo R --pr N [--runs 5] [--out finder-ab.jsonl]
+```
+
+The input mode is forced through the shipped knob and nothing else:
+`REVIEW_BOT_DIFF_CAP=100000000` (nothing elides) versus `=1` (everything does).
+It **never posts** — every invocation carries `--print-only` — and it drives
+`review-bot-review-local`, not the `review-bot-review` socket client, because
+the client cannot carry the cap (`review-bot-serve` whitelists request fields
+and honours engine/env settings only from its own trusted environment). Running
+local therefore needs the forge token plus live engine credentials. By default
+it `nix-build`s the package and uses `$out/bin/review-bot-review-local`;
+`--binary PATH` overrides that.
+
+Every run appends one JSON object to `--out` (harness, forced cap, run index,
+exit status, the draft→surviving counts and diff mode parsed from the rendered
+footer, the **measured diff size and the cap actually applied** read off the
+reviewer's journal line, and the verdict); a run whose review aborts is recorded
+**with** its status rather than dropped. Cells are comparable by construction:
+the PR head is re-read before every run and a moved head aborts the experiment
+instead of mixing two diffs into one cell. The summary table has one row per
+cell with the run count, aborted count, number of empty drafts, and the mean
+draft and surviving finding counts.
+
+**Target a PR whose diff against its merge base is non-empty.** Since #26
+`review.py` prefers the forge-recorded merge base, so a *merged* PR normally
+still yields its original diff — merged PRs are in fact the better subjects,
+since their heads are frozen and the runs are reproducible. A 0-char diff now
+means either the PR really changes nothing, or the recorded base was unusable
+and the live fallback collapsed to the head; `review.py`'s
+`merge base … (computed live — <reason>)` journal line says which.
+
+An empty diff satisfies `0 <= cap`, which makes the footer report `inlined` even
+in the forced-elide cells and every cell report zero findings — a null
+experiment that *looks* like a clean result. The harness therefore refuses a
+0-char diff outright rather than tabulating it, and the recorded diff size is
+what distinguishes "the cap did not take" from "there was nothing to review".
+
+The harness refuses the symmetric masquerade too: if the cap the reviewer
+actually applied differs from the one forced, the run aborts. Otherwise every
+cell would share one input mode and the matching means would read as the
+experiment's conclusion rather than as a broken instrument — the usual cause
+being `--binary` pointed at `review-bot-review`, the socket client, which
+silently drops `REVIEW_BOT_DIFF_CAP`.
 
 ## Serve / client mode
 
