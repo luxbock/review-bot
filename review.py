@@ -832,7 +832,7 @@ def fmt_loc(f):
     return f"`{path}`"
 
 
-def render_markdown(review, harnesses, depth, bar, merge_base):
+def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None):
     verdict = review["verdict"]
     findings = review["findings"]
     findings.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
@@ -885,7 +885,9 @@ def render_triage_markdown(triage, harnesses, depth, bar, head_sha):
     return "\n".join(out)
 
 
-def render_audit_markdown(audit, repo, harnesses, depth, bar, head_sha, supersedes=None):
+def render_audit_markdown(
+    audit, repo, harnesses, depth, bar, head_sha, supersedes=None, provenance=None
+):
     """Render the ranked audit findings as the BODY of a create-issue POST. Findings arrive
     most-severe-first; we preserve that order but group under severity-band headers using the
     existing SEVERITY_ORDER / SEVERITY_EMOJI vocabulary."""
@@ -946,23 +948,43 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
     """Generate per harness → (depth>quick) verify → (multi-harness) synthesise.
 
     verify_fill(result)->prompt and synth_fill(results)->prompt are mode-specific
-    template-fillers; verify_fill is None at depth=quick. Returns the final normalized obj.
+    template-fillers; verify_fill is None at depth=quick. Returns the final normalized
+    object alongside generator-stage provenance for the review and audit renderers.
     """
     results = []
+    stages = []
     for h in harnesses:
         r = review_via(h, gen_prompt, cdir, False, mode)
-        if depth != "quick" and r is not None and verify_fill is not None:
+        draft_count = None
+        if r is not None and mode in ("pr", "repo"):
+            draft_count = len(r["findings"])
+        should_verify = (
+            depth != "quick"
+            and r is not None
+            and verify_fill is not None
+            and not (mode in ("pr", "repo") and draft_count == 0)
+        )
+        if should_verify:
             v = review_via(h, verify_fill(r), cdir, False, mode)
             if v is not None:
                 r = v
+        if r is not None and draft_count is not None:
+            stages.append(
+                {
+                    "harness": h,
+                    "draft_count": draft_count,
+                    "surviving_count": len(r["findings"]),
+                }
+            )
         results.append(r)
     results = [r for r in results if r is not None]
     if not results:
         die("no engine produced a usable result")
+    provenance = {"stages": stages, "synthesized": len(results) > 1}
     if len(results) == 1:
-        return results[0]
+        return results[0], provenance
     synth = review_via(harnesses[0], synth_fill(results), cdir, False, mode)
-    return synth if synth is not None else results[0]
+    return (synth if synth is not None else results[0]), provenance
 
 
 def post_or_print(args, token, markdown, kind):
@@ -1064,8 +1086,12 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
             log("dry run complete — no engines executed, nothing posted")
             return
 
-        final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "pr")
-        markdown = render_markdown(final, harnesses, args.depth, bar, merge_base)
+        final, provenance = run_pipeline(
+            harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "pr"
+        )
+        markdown = render_markdown(
+            final, harnesses, args.depth, bar, merge_base, provenance=provenance
+        )
         return post_or_print(args, token, markdown, "review")
 
 
@@ -1117,7 +1143,9 @@ def do_issue_triage(args, harnesses, bar, focus, token, auth):
             log("dry run complete — no engines executed, nothing posted")
             return
 
-        final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "issue")
+        final, _provenance = run_pipeline(
+            harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "issue"
+        )
         markdown = render_triage_markdown(final, harnesses, args.depth, bar, head_sha)
         return post_or_print(args, token, markdown, "triage")
 
@@ -1164,13 +1192,24 @@ def do_repo_audit(args, harnesses, bar, focus, token, auth):
             log("dry run complete — no engines executed, nothing posted")
             return
 
-        final = run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "repo")
+        final, provenance = run_pipeline(
+            harnesses, gen_prompt, verify_fill, synth_fill, cdir, args.depth, "repo"
+        )
         # Dedup: link (not close) a prior audit issue if one is open. Skipped under --print-only.
         supersedes = None
         if not args.print_only:
             supersedes = find_existing_audit_issue(args.owner, args.repo, token)
         repo_slug = f"{args.owner}/{args.repo}"
-        markdown = render_audit_markdown(final, repo_slug, harnesses, args.depth, bar, head_sha, supersedes)
+        markdown = render_audit_markdown(
+            final,
+            repo_slug,
+            harnesses,
+            args.depth,
+            bar,
+            head_sha,
+            supersedes,
+            provenance=provenance,
+        )
         title = f"{AUDIT_TITLE_PREFIX} {repo_slug} maintainability findings"
         return post_or_create_issue(args, token, title, markdown, "audit")
 
