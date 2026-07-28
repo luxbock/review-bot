@@ -832,6 +832,36 @@ def fmt_loc(f):
     return f"`{path}`"
 
 
+def provenance_counts(provenance):
+    stages = provenance.get("stages", []) if provenance else []
+    counts = ", ".join(
+        f"{stage['harness']} {stage['draft_count']}→{stage['surviving_count']}"
+        for stage in stages
+    )
+    if counts and provenance.get("synthesized"):
+        counts += ", synthesized"
+    return counts
+
+
+def append_clean_review_provenance(out, provenance):
+    stages = provenance.get("stages", []) if provenance else []
+    if not stages:
+        return
+    total_draft = sum(stage["draft_count"] for stage in stages)
+    if total_draft == 0:
+        out += [
+            "⚠️ The finder stage returned no findings, so nothing was verified — "
+            "this reports an empty finder, not a verified-clean diff.",
+            "",
+        ]
+    elif sum(stage["surviving_count"] for stage in stages) == 0:
+        out += [
+            f"All {total_draft} draft finding(s) were checked and dropped by the "
+            "verification stage.",
+            "",
+        ]
+
+
 def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None):
     verdict = review["verdict"]
     findings = review["findings"]
@@ -841,6 +871,7 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None):
         out += [review["summary"], ""]
     if not findings:
         out += [f"No blocking issues found at or above the **{bar}** confidence bar.", ""]
+        append_clean_review_provenance(out, provenance)
     else:
         out += [f"### Findings ({len(findings)})", ""]
         for f in findings:
@@ -855,10 +886,13 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None):
             if f["suggestion"]:
                 out += ["> **suggestion:** " + f["suggestion"].replace("\n", "\n> "), ""]
     hlabel = ",".join(harnesses)
+    counts = provenance_counts(provenance)
+    findings_segment = f" · findings `{counts}`" if counts else ""
     out += [
         "---",
         f"*Automated review by **review-bot** · harness `{hlabel}` · depth `{depth}` · "
-        f"bar `{bar}` · merge-base `{merge_base[:12]}`. Advisory only — olli merges. "
+        f"bar `{bar}`{findings_segment} · merge-base `{merge_base[:12]}`. "
+        f"Advisory only — olli merges. "
         f"Re-run with `@review-bot <args>` (e.g. `@review-bot deep with claude,codex`).*",
     ]
     return "\n".join(out)
@@ -919,10 +953,13 @@ def render_audit_markdown(
             if f["suggestion"]:
                 out += ["> **suggestion:** " + f["suggestion"].replace("\n", "\n> "), ""]
     hlabel = ",".join(harnesses)
+    counts = provenance_counts(provenance)
+    findings_segment = f" · findings `{counts}`" if counts else ""
     out += [
         "---",
         f"*Automated audit by **review-bot** · harness `{hlabel}` · depth `{depth}` · "
-        f"bar `{bar}` · repo tip `{head_sha[:12]}`. Advisory only — olli decides which "
+        f"bar `{bar}`{findings_segment} · repo tip `{head_sha[:12]}`. "
+        f"Advisory only — olli decides which "
         f"findings become fixes. Re-run with `@review-bot audit`.*",
     ]
     return "\n".join(out)
