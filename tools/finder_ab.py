@@ -72,6 +72,11 @@ VERDICT_RE = re.compile(r"^## 🤖 review-bot — (.+)$", re.MULTILINE)
 FINDINGS_RE = re.compile(r"· findings `([^`]*)`")
 DIFF_MODE_RE = re.compile(r"· diff `([^`]*)`")
 STAGE_RE = re.compile(r"^(\S+) (\d+)→(\d+)$")
+# The instrumentation line review.py logs to stderr before the first engine call.
+# The footer's inlined/file-list word alone cannot distinguish "the cap did not take"
+# from "the diff was empty" — a 0-char diff reports `inlined` under ANY cap, since the
+# comparison is `0 <= cap`. Capturing the measured size is what makes that visible.
+DIFF_LOG_RE = re.compile(r"diff (\d+) chars vs cap (\d+) — ")
 
 
 def die(msg, code=1) -> NoReturn:
@@ -206,6 +211,13 @@ def run_once(binary, args, harness, mode_label, cap, run_index, head):
     env["REVIEW_BOT_DIFF_CAP"] = str(cap)
     proc = subprocess.run(argv, env=env, capture_output=True, text=True)
     parsed = parse_markdown(proc.stdout)
+    # The measured diff size, straight off the reviewer's own journal line. None when the
+    # line is absent (an older binary, or a stub); 0 means the reviewer had nothing to
+    # review, which main() treats as a vacuous cell rather than a data point.
+    diff_chars, diff_cap_observed = None, None
+    m = DIFF_LOG_RE.search(proc.stderr or "")
+    if m:
+        diff_chars, diff_cap_observed = int(m.group(1)), int(m.group(2))
     record = {
         "harness": harness,
         "input_mode": mode_label,
@@ -220,6 +232,8 @@ def run_once(binary, args, harness, mode_label, cap, run_index, head):
         "stages": parsed["stages"],
         "synthesized": parsed["synthesized"],
         "diff_mode": parsed["diff_mode"],
+        "diff_chars": diff_chars,
+        "diff_cap_observed": diff_cap_observed,
         "verdict": parsed["verdict"],
     }
     # An aborted run keeps its status AND its stderr tail, so a cell that looks thin in
@@ -312,11 +326,26 @@ def main(argv=None):
                     records.append(record)
                     sink.write(json.dumps(record) + "\n")
                     sink.flush()
+                    # A 0-char diff is not a data point: the reviewer had nothing to read,
+                    # so every cell would agree at zero findings for reasons that have
+                    # nothing to do with the input mode under test. `0 <= cap` also makes
+                    # the footer say `inlined` even in the forced-elide cells, so this
+                    # failure MASQUERADES as a clean result. Refuse it loudly and early.
+                    if record["diff_chars"] == 0:
+                        die(
+                            f"{args.owner}/{args.repo}#{args.pr} has a 0-char diff against its "
+                            f"merge base, so there is nothing to review and every cell would be "
+                            f"vacuously empty (a 0-char diff reports `inlined` under any cap). "
+                            f"The usual cause is a MERGED PR: review.py computes the merge base "
+                            f"live, and once the branch is in the base branch that collapses to "
+                            f"the head itself. Target a PR whose branch is not yet merged. "
+                            f"({len(records)} run(s) written to {args.out}.)"
+                        )
                     if record["aborted"]:
                         log(f"  aborted (status {record['status']}) — recorded, not dropped")
                     else:
                         log(f"  {record['draft_findings']}→{record['surviving_findings']} "
-                            f"({record['diff_mode']})")
+                            f"({record['diff_mode']}, {record['diff_chars']} chars)")
 
     print()
     print(f"{args.owner}/{args.repo}#{args.pr} @ {head[:12]} — depth {args.depth}, "

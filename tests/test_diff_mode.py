@@ -338,6 +338,14 @@ if exit_code:
 counts = "claude 0→0" if index % 2 == 0 else "claude 2→1"
 verdict = "✅ no blocking issues" if index % 2 == 0 else "\U0001f4ac comments"
 mode = "file-list" if cap == "1" else "inlined"
+# Mimic review.py's journal line so the harness can record the MEASURED diff size.
+chars = os.environ.get("FINDER_AB_TEST_DIFF_CHARS", "4096")
+if chars == "0":
+    mode = "inlined"  # 0 <= any cap — the masquerade the harness must refuse
+sys.stderr.write(
+    "review-bot-review: diff " + chars + " chars vs cap " + (cap or "60000")
+    + " — " + ("inlined" if mode == "inlined" else "file-list only") + "\n"
+)
 print("## \U0001f916 review-bot — " + verdict)
 print()
 print("---")
@@ -485,6 +493,61 @@ def test_finder_ab_aborts_when_head_moves():
     print("ok  7. finder_ab: a moving PR head aborts loudly instead of mixing cells")
 
 
+def test_finder_ab_refuses_a_vacuous_zero_char_diff():
+    """The failure this harness shipped with: a 0-char diff satisfies `0 <= cap`, so the
+    footer says `inlined` even in the forced-elide cells, every cell reports zero findings,
+    and the run LOOKS like a clean result. Observed live against a merged PR, where the
+    live-computed merge base collapses to the head. It must abort, not tabulate."""
+    with scratch_dir() as tmp:
+        stub, _log = make_stub_binary(tmp)
+        os.environ.pop("FINDER_AB_TEST_EXIT", None)
+        os.environ["FINDER_AB_TEST_DIFF_CHARS"] = "0"
+        out = os.path.join(tmp, "finder-ab.jsonl")
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                fresh_finder_ab().main([
+                    "--owner", "acme", "--repo", "widget", "--pr", "7",
+                    "--runs", "2", "--binary", stub, "--out", out,
+                ])
+        except SystemExit as e:
+            code = e.code
+        else:
+            raise AssertionError("a 0-char diff must abort rather than produce a table")
+        finally:
+            os.environ.pop("FINDER_AB_TEST_DIFF_CHARS", None)
+        records = read_jsonl(out)
+    assert code == 1
+    msg = err.getvalue()
+    assert "0-char diff" in msg and "MERGED PR" in msg, msg
+    assert len(records) == 1, records          # the observation is kept, the cells are not
+    assert records[0]["diff_chars"] == 0, records[0]
+    assert records[0]["diff_mode"] == "inlined"  # the masquerade, recorded for the record
+    print("ok  8. finder_ab: a vacuous 0-char diff aborts instead of tabulating")
+
+
+def test_finder_ab_records_measured_diff_size():
+    """diff_mode alone cannot separate 'the cap did not take' from 'the diff was empty';
+    the measured size can."""
+    with scratch_dir() as tmp:
+        stub, _log = make_stub_binary(tmp)
+        os.environ.pop("FINDER_AB_TEST_EXIT", None)
+        os.environ["FINDER_AB_TEST_DIFF_CHARS"] = "65525"
+        out = os.path.join(tmp, "finder-ab.jsonl")
+        try:
+            rc, _table = run_finder_ab(fresh_finder_ab(), stub, out, runs=1)
+        finally:
+            os.environ.pop("FINDER_AB_TEST_DIFF_CHARS", None)
+        records = read_jsonl(out)
+    assert rc == 0
+    assert len(records) == 4, records
+    for rec in records:
+        assert rec["diff_chars"] == 65525, rec
+        expected_cap = 1 if rec["input_mode"] == "forced-elide" else 100000000
+        assert rec["diff_cap_observed"] == expected_cap, rec
+    print("ok  9. finder_ab: the measured diff size and the cap actually applied are recorded")
+
+
 def main():
     tests = [
         test_cap_boundary_is_exact,
@@ -494,6 +557,8 @@ def main():
         test_finder_ab_factorial_print_only_and_caps,
         test_finder_ab_records_aborted_runs,
         test_finder_ab_aborts_when_head_moves,
+        test_finder_ab_refuses_a_vacuous_zero_char_diff,
+        test_finder_ab_records_measured_diff_size,
     ]
     for test in tests:
         test()

@@ -100,12 +100,22 @@ it `nix-build`s the package and uses `$out/bin/review-bot-review-local`;
 
 Every run appends one JSON object to `--out` (harness, forced cap, run index,
 exit status, the draft→surviving counts and diff mode parsed from the rendered
-footer, and the verdict); a run whose review aborts is recorded **with** its
-status rather than dropped. Cells are comparable by construction: the PR head is
-re-read before every run and a moved head aborts the experiment instead of
-mixing two diffs into one cell. The summary table has one row per cell with the
-run count, aborted count, number of empty drafts, and the mean draft and
-surviving finding counts.
+footer, the **measured diff size and the cap actually applied** read off the
+reviewer's journal line, and the verdict); a run whose review aborts is recorded
+**with** its status rather than dropped. Cells are comparable by construction:
+the PR head is re-read before every run and a moved head aborts the experiment
+instead of mixing two diffs into one cell. The summary table has one row per
+cell with the run count, aborted count, number of empty drafts, and the mean
+draft and surviving finding counts.
+
+**Target a PR that is not yet merged.** `review.py` computes the merge base
+live, so once a branch is merged into its base that merge base collapses to the
+head itself and the diff is empty. An empty diff satisfies `0 <= cap`, which
+makes the footer report `inlined` even in the forced-elide cells and every cell
+report zero findings — a null experiment that *looks* like a clean result. The
+harness therefore refuses a 0-char diff outright rather than tabulating it, and
+the recorded diff size is what distinguishes "the cap did not take" from "there
+was nothing to review".
 
 ## Serve / client mode
 
