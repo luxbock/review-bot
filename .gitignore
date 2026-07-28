@@ -5,3 +5,5 @@ __pycache__/
 /.factory/
 # Claude Code session scaffolding — same story
 /.claude/
+# finder_ab.py's default --out, written into the checkout it is run from
+/finder-ab.jsonl
