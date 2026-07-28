@@ -184,7 +184,10 @@ def run_pr_case(tmpdir, responses):
         "head": {"sha": head},
     }
 
-    def prepare(owner, repo, pr, base_ref, auth, repo_dir=None, expected_head=None):
+    def prepare(
+        owner, repo, pr, base_ref, auth, repo_dir=None,
+        expected_head=None, recorded_merge_base=None,
+    ):
         assert expected_head == head
         return checkout, base
 

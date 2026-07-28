@@ -29,7 +29,14 @@ Three modes, sharing all the identity/git/engine/post plumbing:
   otherwise land on the pre-push commit. Bounded exponential backoff
   (`REVIEW_BOT_HEAD_SYNC_RETRIES`, `REVIEW_BOT_HEAD_SYNC_BASE_SECS`) absorbs
   the propagation lag; a persistent mismatch aborts with a distinct error
-  rather than review a stale tree (issue #16).
+  rather than review a stale tree (issue #16). For the diff boundary it prefers
+  the forge-recorded `meta["merge_base"]` when that commit is available locally
+  and remains an ancestor of the converged head. This preserves the original PR
+  diff after the PR has been merged, when a live merge-base calculation would
+  collapse to the PR head. An absent, unknown, or non-ancestor recorded value
+  falls back to a live calculation with the reason logged. Regardless of the
+  source, a zero-length diff aborts rather than being reviewed or posted as a
+  vacuous pass.
 - `serve.py`  → `review-bot-serve`  — inetd-style service entry point (see
   *Serve / client mode* below).
 - `client.py` → `review-bot-review` — the credential-free client callers use.
