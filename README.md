@@ -86,8 +86,15 @@ The second line is one JSON object: the harness, the raw output size and a
 head+tail excerpt of it (4000 chars, with the elided count stated), whether the
 JSON-repair retry fired, and — the discriminator — the *pre-normalization* facts
 `verdict_present`, `verdict_raw`, `findings_kind`, `findings_len`, `keys` and the
-`path` by which the JSON was reached. Case 1 shows `verdict_present: true` with
-`findings_kind: "list"`; case 2 shows the keys of whatever was actually scraped.
+`path` by which the JSON was reached, plus the `mode` that ran. Case 1 shows
+`verdict_present: true` with `findings_kind: "list"`; case 2 shows the keys of whatever
+was actually scraped.
+
+The discriminator follows the schema of the mode that ran. An explicit `findings` list is
+the universal tell; a `verdict` is required evidence in **PR mode only**, because the
+audit schema carries none by design (`AUDIT_SCHEMA_HINT`, `normalize_audit`). Demanding
+one everywhere would report every clean repo audit as a parse pathology — a false alarm in
+the single signal this diagnostic exists to give.
 Under `review-bot-serve` these land in the service journal; `poll.py` discards a
 successful review's stderr, so read the service unit, not the poller.
 Review and audit footers also include a `findings` segment directly after the `bar`

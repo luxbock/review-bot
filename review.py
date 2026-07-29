@@ -891,16 +891,36 @@ def _fill_diag(diag, **fields):
         diag.update(fields)
 
 
+def empty_finder_is_genuine(parse, mode):
+    """Did the engine really answer with an empty result list, or did normalize() default
+    its way there? An explicit `findings` list is the universal tell. A `verdict` is
+    required evidence in PR mode only: the audit schema carries none by design
+    (AUDIT_SCHEMA_HINT, normalize_audit), so demanding one there inverts the signal and
+    reports every clean audit as a parse pathology."""
+    if not parse or parse.get("findings_kind") != "list":
+        return False
+    return bool(parse.get("verdict_present")) or mode == "repo"
+
+
 def log_empty_finder_diagnostic(harness, diag):
     """Journal what the engine actually emitted, human line first then one JSON line."""
     diag = diag or {}
     parse = diag.get("parse") or {}
-    retry = " after a JSON-repair retry," if diag.get("repair_retried") else ""
+    mode = diag.get("mode", "pr")
+    call = (
+        "genuine empty result"
+        if empty_finder_is_genuine(parse, mode)
+        else "DEFAULTED — not a real result object"
+    )
+    if mode == "repo":
+        verdict_note = "n/a, the audit schema carries none"
+    else:
+        verdict_note = "present" if parse.get("verdict_present") else "ABSENT — defaulted"
+    retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
     log(
-        f"EMPTY FINDER ({harness}): zero drafts,{retry} verify stage skipped. "
-        f"parse-path {parse.get('path', '(unparsed)')}, "
-        f"verdict {parse.get('verdict_raw')!r} "
-        f"({'present' if parse.get('verdict_present') else 'ABSENT — defaulted'}), "
+        f"EMPTY FINDER ({harness}, {mode} mode): {call}. Zero drafts{retry} "
+        f"verify stage skipped. parse-path {parse.get('path', '(unparsed)')}, "
+        f"verdict {parse.get('verdict_raw')!r} ({verdict_note}), "
         f"findings {parse.get('findings_kind', '(none)')}, "
         f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
     )
@@ -943,7 +963,7 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     else:
         norm, key = normalize, "verdict"
 
-    _fill_diag(diag, harness=harness, raw_chars=len(raw), raw_excerpt=_clip(raw))
+    _fill_diag(diag, harness=harness, mode=mode, raw_chars=len(raw), raw_excerpt=_clip(raw))
     result, text, parse = _parse_engine_output(raw, harness, key, norm)
     if result is not None:
         _fill_diag(diag, repair_retried=False, parse=parse)

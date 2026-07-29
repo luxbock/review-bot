@@ -353,8 +353,8 @@ if counts.endswith("0→0") and diag_shape:
                  "findings_kind": "missing", "findings_len": None}
     sys.stderr.write(
         "review-bot-review: empty-finder diagnostic: "
-        + json.dumps({"harness": "claude", "raw_chars": 42, "raw_excerpt": "…",
-                      "repair_retried": False, "parse": parse})
+        + json.dumps({"harness": "claude", "mode": "pr", "raw_chars": 42,
+                      "raw_excerpt": "…", "repair_retried": False, "parse": parse})
         + "\n"
     )
 mode = "file-list" if cap == "1" else "inlined"
@@ -631,11 +631,19 @@ def test_finder_ab_stores_the_empty_finder_diagnostic():
     # Non-empty runs stay clean: the field marks the exceptional case only.
     assert all("empty_finder_diag" not in r for r in records if r["draft_findings"]), records
     described = [mod.describe_empty_diag(r) for r in empties]
-    assert sum("genuine empty verdict" in d for d in described) == 2, described
+    assert sum("genuine empty result" in d for d in described) == 2, described
     assert sum("DEFAULTED" in d for d in described) == 2, described
     # …and the operator sees it without reaching for jq.
     assert "empty finders (4)" in table, table
-    assert "DEFAULTED — not a real review object" in table, table
+    assert "DEFAULTED — not a real result object" in table, table
+    # The classifier follows the schema of the mode that ran. finder_ab only ever drives
+    # --mode pr, but a verdict-keyed check would call every clean AUDIT a parse pathology.
+    audit_clean = {"empty_finder_diag": {"mode": "repo", "parse": {
+        "findings_kind": "list", "verdict_present": False, "verdict_raw": None,
+        "path": "envelope-result", "keys": ["findings", "summary"]}}}
+    described_audit = mod.describe_empty_diag(audit_clean)
+    assert described_audit.startswith("genuine empty result"), described_audit
+    assert "verdict n/a (audit schema)" in described_audit, described_audit
     print("ok 11. finder_ab: empty runs keep the reviewer's diagnostic and are classified")
 
 

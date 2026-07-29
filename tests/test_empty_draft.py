@@ -331,10 +331,17 @@ def test_empty_repo_audit_skips_verify_and_has_footer():
     assert markdown.startswith("## 🤖 review-bot audit — acme/widget maintainability findings")
     assert "No maintainability findings at or above the **medium** confidence bar." in markdown
     assert "findings `claude 0→0`" in markdown
-    # The audit pipeline shares run_pipeline, so it gets the same diagnostic.
+    # The audit pipeline shares run_pipeline, so it gets the same diagnostic — but the
+    # audit schema carries NO verdict (normalize_audit / AUDIT_SCHEMA_HINT), so a
+    # verdict-keyed discriminator would call every clean audit a parse pathology and send
+    # an operator after a bug that is not there.
     diag = empty_finder_diag(err)
-    assert diag is not None and diag["parse"]["findings_kind"] == "list", diag
-    print("ok  4. empty repo audit: one call, audit provenance footer, diagnostic")
+    assert diag is not None and diag["mode"] == "repo", diag
+    assert diag["parse"]["findings_kind"] == "list", diag
+    assert diag["parse"]["verdict_present"] is False, diag
+    assert "DEFAULTED" not in err and "ABSENT" not in err, err
+    assert "genuine empty result" in err and "verdict None (n/a, the audit schema" in err, err
+    print("ok  4. empty repo audit: diagnostic reads the audit schema, not the PR schema")
 
 
 def test_green_nonempty_verdict_keeps_body_and_footer():
@@ -361,8 +368,10 @@ def test_genuine_empty_verdict_is_recorded_as_genuine():
     assert diag is not None, err
     assert diag["harness"] == "claude" and diag["repair_retried"] is False, diag
     parse = diag["parse"]
+    assert diag["mode"] == "pr", diag
     assert parse["path"] == "envelope-result", parse
     assert parse["verdict_present"] is True and parse["verdict_raw"] == "approve", parse
+    assert "genuine empty result" in err and "DEFAULTED" not in err, err
     assert parse["findings_kind"] == "list" and parse["findings_len"] == 0, parse
     assert parse["keys"] == ["findings", "summary", "verdict"], parse
     # The excerpt is the untouched engine stdout — the claude envelope, escaping and all.
@@ -387,6 +396,25 @@ def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
     assert parse["findings_kind"] == "missing" and parse["findings_len"] is None, parse
     assert parse["keys"] == ["file", "line_start", "severity"], parse
     assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
+    assert "DEFAULTED — not a real result object" in err, err
+
+
+def test_genuine_check_is_mode_aware():
+    """The one signal this diagnostic exists to give must not invert between modes."""
+    review = fresh_review()
+    audit_clean = {"findings_kind": "list", "verdict_present": False}
+    pr_clean = {"findings_kind": "list", "verdict_present": True}
+    scraped = {"findings_kind": "missing", "verdict_present": False}
+    # An audit reply legitimately carries no verdict; a PR reply that lacks one was
+    # defaulted into existence by normalize().
+    assert review.empty_finder_is_genuine(audit_clean, "repo") is True
+    assert review.empty_finder_is_genuine(audit_clean, "pr") is False
+    assert review.empty_finder_is_genuine(pr_clean, "pr") is True
+    # A missing findings list is never genuine, in either mode.
+    assert review.empty_finder_is_genuine(scraped, "repo") is False
+    assert review.empty_finder_is_genuine(scraped, "pr") is False
+    assert review.empty_finder_is_genuine({}, "pr") is False
+    print("ok  9. the genuine/defaulted check follows the schema of the mode that ran")
     print("ok  7. degenerate parse renders identically but is recorded as defaulted")
 
 
@@ -410,6 +438,7 @@ def main():
         test_genuine_empty_verdict_is_recorded_as_genuine,
         test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted,
         test_raw_excerpt_clips_head_and_tail,
+        test_genuine_check_is_mode_aware,
     ]
     for test in tests:
         test()
