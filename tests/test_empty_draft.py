@@ -397,6 +397,22 @@ def test_discarded_findings_entries_are_not_reported_as_genuine():
     print("ok  5. entries discarded by normalize are reported as defaulted, with the count")
 
 
+def test_null_findings_counts_as_the_engine_answering_clean():
+    """normalize*'s `obj.get("findings") or []` makes `null` indistinguishable from `[]`,
+    and it is the one non-list shape an engine plausibly means as "no findings". Flagging
+    it would put a false DEFAULTED on every clean audit that spells it that way."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_repo_case(
+            tmp, [{"summary": "nothing found", "findings": None}]
+        )
+    assert calls == 1, calls
+    assert "findings `claude 0\u21920`" in markdown, markdown
+    diag = empty_finder_diag(err)
+    assert diag["parse"]["findings_kind"] == "null", diag
+    assert "genuine empty result" in err and "DEFAULTED" not in err, err
+    print("ok  6. a null findings value reads as the engine answering, not as a pathology")
+
+
 def test_green_nonempty_verdict_keeps_body_and_footer():
     with scratch_dir() as tmp:
         markdown, calls, err = run_pr_case(tmp, [VERIFIED_ONE, VERIFIED_ONE])
@@ -410,7 +426,7 @@ def test_green_nonempty_verdict_keeps_body_and_footer():
     # A non-empty finder journals nothing: the diagnostic marks a rare event, so it must
     # stay rare enough to be worth grepping for.
     assert empty_finder_diag(err) is None, err
-    print("ok  6. green verdict with a finding retains body and gains footer only")
+    print("ok  7. green verdict with a finding retains body and gains footer only")
 
 
 def test_genuine_empty_verdict_is_recorded_as_genuine():
@@ -430,7 +446,7 @@ def test_genuine_empty_verdict_is_recorded_as_genuine():
     # The excerpt is the untouched engine stdout — the claude envelope, escaping and all.
     assert diag["raw_excerpt"].startswith('{"result":') and "approve" in diag["raw_excerpt"], diag
     assert diag["raw_chars"] == len(diag["raw_excerpt"]), diag
-    print("ok  7. genuine empty verdict: diagnostic records an explicit approve")
+    print("ok  8. genuine empty verdict: diagnostic records an explicit approve")
 
 
 def test_verdict_only_approve_is_genuine_not_a_pathology():
@@ -446,7 +462,7 @@ def test_verdict_only_approve_is_genuine_not_a_pathology():
     assert diag["parse"]["findings_kind"] == "missing", diag
     assert diag["parse"]["verdict_raw"] == "approve", diag
     assert "genuine empty result" in err and "DEFAULTED" not in err, err
-    print("ok  8. a verdict-only approve counts as genuine, not as a parse pathology")
+    print("ok  9. a verdict-only approve counts as genuine, not as a parse pathology")
 
 
 def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
@@ -466,7 +482,7 @@ def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
     assert parse["keys"] == ["file", "line_start", "severity"], parse
     assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
     assert "DEFAULTED — not a real result object" in err, err
-    print("ok  9. degenerate parse renders identically but is recorded as defaulted")
+    print("ok 10. degenerate parse renders identically but is recorded as defaulted")
 
 
 GOOD_TRIAGE = {
@@ -500,7 +516,7 @@ def test_good_triage_journals_nothing():
     assert calls == 2, calls
     assert "🐛 genuine bug" in markdown, markdown
     assert defaulted_triage_diag(err) is None, err
-    print("ok 11. a triage the engine actually produced journals nothing")
+    print("ok 12. a triage the engine actually produced journals nothing")
 
 
 def test_defaulted_triage_disposition_is_journalled():
@@ -520,7 +536,7 @@ def test_defaulted_triage_disposition_is_journalled():
     assert "I think this is a real defect" in diag["raw_excerpt"], diag
     assert "DEFAULTED TRIAGE (claude, verify stage)" in err, err
     assert "supplied none" in err and "this is the disposition being posted" in err, err
-    print("ok 12. a disposition defaulted at the verify stage is journalled")
+    print("ok 13. a disposition defaulted at the verify stage is journalled")
 
 
 def test_a_draft_anomaly_that_verification_repaired_is_not_journalled():
@@ -533,7 +549,7 @@ def test_a_draft_anomaly_that_verification_repaired_is_not_journalled():
     assert "🐛 genuine bug" in markdown, markdown
     assert defaulted_triage_diag(err) is None, err
     assert "DEFAULTED TRIAGE" not in err, err
-    print("ok 13. a draft anomaly the verify stage repaired is not reported as defaulted")
+    print("ok 14. a draft anomaly the verify stage repaired is not reported as defaulted")
 
 
 def test_unrecognised_triage_disposition_counts_as_defaulted():
@@ -546,7 +562,7 @@ def test_unrecognised_triage_disposition_counts_as_defaulted():
     assert diag["parse"]["disposition_present"] is True, diag
     assert diag["parse"]["disposition_raw"] == "probably-fine", diag
     assert "supplied 'probably-fine'" in err, err
-    print("ok 14. an unrecognised triage disposition is journalled, not silently coerced")
+    print("ok 15. an unrecognised triage disposition is journalled, not silently coerced")
 
 
 def test_genuine_check_is_mode_aware():
@@ -584,7 +600,17 @@ def test_genuine_check_is_mode_aware():
     assert review.empty_finder_is_genuine(discarded, "repo") is False
     assert review.empty_finder_is_genuine(discarded, "pr") is False
     assert review.empty_finder_is_genuine(approve_with_discarded, "pr") is False
-    print("ok 15. the genuine/defaulted check follows the schema of the mode that ran")
+    # `null` is an answer in either mode; the other falsy shapes normalize the same way
+    # but are malformed, so they stay pathologies.
+    null_findings = {"findings_kind": "null", "findings_len": None,
+                     "verdict_present": False, "verdict_raw": None}
+    assert review.empty_finder_is_genuine(null_findings, "repo") is True
+    assert review.empty_finder_is_genuine(null_findings, "pr") is True
+    for junk in ("dict", "str", "int"):
+        assert review.empty_finder_is_genuine(
+            {"findings_kind": junk, "verdict_present": False, "verdict_raw": None}, "repo"
+        ) is False, junk
+    print("ok 16. the genuine/defaulted check follows the schema of the mode that ran")
 
 
 def test_raw_excerpt_clips_head_and_tail():
@@ -594,7 +620,7 @@ def test_raw_excerpt_clips_head_and_tail():
     assert clipped.startswith("A" * 50) and clipped.endswith("Z" * 50), clipped
     assert "MIDDLE" not in clipped and "5906 chars elided" in clipped, clipped
     assert review._clip("short", limit=100) == "short"
-    print("ok 10. raw excerpt keeps both ends and states how much it dropped")
+    print("ok 11. raw excerpt keeps both ends and states how much it dropped")
 
 
 def main():
@@ -604,6 +630,7 @@ def main():
         test_degenerate_two_findings_verified_to_one,
         test_empty_repo_audit_skips_verify_and_has_footer,
         test_discarded_findings_entries_are_not_reported_as_genuine,
+        test_null_findings_counts_as_the_engine_answering_clean,
         test_green_nonempty_verdict_keeps_body_and_footer,
         test_genuine_empty_verdict_is_recorded_as_genuine,
         test_verdict_only_approve_is_genuine_not_a_pathology,

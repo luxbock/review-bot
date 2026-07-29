@@ -290,10 +290,12 @@ def describe_empty_diag(record):
     # Either tell suffices — an EXPLICITLY EMPTY list (a non-empty one that still reached
     # zero drafts means normalize* discarded its entries), or (PR mode only, since the
     # audit schema carries none) a recognised verdict with no `findings` key at all.
+    # `null` counts: normalize* collapses it to [] identically. The other falsy shapes
+    # ({} / "" / 0) collapse the same way but are malformed rather than answers.
     kind, length = parse.get("findings_kind"), parse.get("findings_len")
-    genuine = (length == 0 if kind == "list" else
+    genuine = (kind == "null" or (length == 0 if kind == "list" else
                mode != "repo" and kind == "missing"
-               and parse.get("verdict_raw") in VERDICT_VALUES)
+               and parse.get("verdict_raw") in VERDICT_VALUES))
     label = "genuine empty result" if genuine else "DEFAULTED — not a real result object"
     verdict = ("verdict n/a (audit schema)" if mode == "repo"
                else f"verdict {parse.get('verdict_raw')!r}")

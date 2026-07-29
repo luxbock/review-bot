@@ -99,6 +99,11 @@ The discriminator follows the schema of the mode that ran, and **either tell suf
   list must have been empty as sent: `normalize*` silently drops non-dict entries, so a
   list that was non-empty and still reached zero drafts is manufacturing, not answering,
   and the journal line says `list of N — every entry discarded by normalize`.
+- `"findings": null` — recorded as `findings_kind: "null"` and counted as an answer, since
+  `normalize*`'s `obj.get("findings") or []` collapses it to the empty-list case
+  identically and it is the one non-list shape an engine plausibly means as "no findings".
+  The other falsy shapes (`{}`, `""`, `0`) collapse the same way but are malformed rather
+  than answers, so they remain case 2.
 - in **PR mode**, a **recognised** `verdict` value with no `findings` key at all, so the
   common shorthand `{"verdict":"approve","summary":…}` is not flagged. The *value* is
   checked rather than mere presence, which keeps a quoted schema
