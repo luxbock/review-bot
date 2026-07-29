@@ -42,6 +42,13 @@ Three modes, sharing all the identity/git/engine/post plumbing:
 - `client.py` → `review-bot-review` — the credential-free client callers use.
 - `poll.py`   → `review-bot-poll`   — scans readable Forgejo repos for
   `@review-bot` mention comments and dispatches the reviewer (via the client).
+  Review↔fix rounds are capped **per revision**: each PR review's footer stamps
+  the reviewed head (`` head `<sha12>` ``), and only reviews carrying the
+  current head's stamp count toward `REVIEW_BOT_MAX_ROUNDS` (default 3), so
+  pushing new commits re-arms automatic review. A lifetime backstop
+  `REVIEW_BOT_MAX_TOTAL` (default 12) counts every review ever posted on the
+  PR — reviews of old heads and pre-stamp legacy reviews included — and, once
+  spent, parks automatic reviews for good (no push re-arms it).
 - `feedback.py` → `review-bot-feedback` — read-only fetch of review-bot's
   already-posted feedback for a PR/issue (see *Reading feedback back* below).
 - `*-prompt.md` — the portable review / verify / synthesis / triage prompts.

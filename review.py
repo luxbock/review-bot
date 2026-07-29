@@ -1255,7 +1255,7 @@ def append_clean_review_provenance(out, provenance, diff_stats=None):
 
 
 def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, diff_inlined=None,
-                    diff_stats=None):
+                    diff_stats=None, head_sha=None):
     verdict = review["verdict"]
     findings = review["findings"]
     findings.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
@@ -1287,10 +1287,14 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, 
     diff_segment = ""
     if diff_inlined is not None:
         diff_segment = f" · diff `{'inlined' if diff_inlined else 'file-list'}`"
+    # head_sha stamps the reviewed head into the footer so poll.py can attribute this
+    # review to a revision (per-revision round cap, issue #29). None (no caller
+    # information, e.g. a direct render in a test) simply omits the segment.
+    head_segment = f" · head `{head_sha[:12]}`" if head_sha else ""
     out += [
         "---",
         f"*Automated review by **review-bot** · harness `{hlabel}` · depth `{depth}` · "
-        f"bar `{bar}`{findings_segment}{diff_segment} · merge-base `{merge_base[:12]}`. "
+        f"bar `{bar}`{findings_segment}{diff_segment} · merge-base `{merge_base[:12]}`{head_segment}. "
         f"Advisory only — olli merges. "
         f"Re-run with `@review-bot <args>` (e.g. `@review-bot deep with claude,codex`).*",
     ]
@@ -1548,7 +1552,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
         )
         markdown = render_markdown(
             final, harnesses, args.depth, bar, merge_base, provenance=provenance,
-            diff_inlined=diff_inlined, diff_stats=diff_stats,
+            diff_inlined=diff_inlined, diff_stats=diff_stats, head_sha=expected_head,
         )
         return post_or_print(args, token, markdown, "review")
 

@@ -14,8 +14,9 @@ new, undeduped @mention (dedup by comment id) — no label triggers, no round ca
 
 It parses the NL args into {harness, depth, bar, focus} deterministically (so focus
 text can't smuggle harness/depth/bar overrides), dedups so it never loops on the same mention
-or head SHA, caps review↔fix rounds (then parks + pings olli), and never reviews on a
-plain push. review-bot stays read-only — it only ever comments; olli merges.
+or head SHA, caps review↔fix rounds per revision (then parks + pings olli) with a lifetime
+budget backstop, and never reviews on a plain push. review-bot stays read-only — it only
+ever comments; olli merges.
 
 Design: notes/decisions/forgejo-dev-workflow.md (review-bot), forgejo-multi-identity.md.
 """
@@ -58,13 +59,14 @@ OWNER_HANDLE = os.environ.get("REVIEW_BOT_OWNER_HANDLE", "olli")
 DEFAULT_DEPTH = os.environ.get("REVIEW_BOT_DEFAULT_DEPTH", "standard")
 DEFAULT_HARNESS = os.environ.get("REVIEW_BOT_DEFAULT_HARNESS", "claude")
 MAX_ROUNDS = int(os.environ.get("REVIEW_BOT_MAX_ROUNDS", "3"))
+MAX_TOTAL = int(os.environ.get("REVIEW_BOT_MAX_TOTAL", "12"))
 MAX_PER_RUN = int(os.environ.get("REVIEW_BOT_MAX_PER_RUN", "3"))
 MAX_FAILS = int(os.environ.get("REVIEW_BOT_MAX_FAILS", "3"))
 
 # Footer substring present in EVERY real review — used to count review rounds and to
 # recognise our own reviews. Must match render_markdown in review.py. A parked notice
 # and review.py's in-band "could not complete" notice both lack it on purpose, so
-# neither counts toward MAX_ROUNDS.
+# neither counts toward MAX_ROUNDS or MAX_TOTAL.
 REVIEW_MARKER = "Automated review by **review-bot**"
 PARK_MARKER = "review-bot — parked"
 
@@ -250,15 +252,56 @@ def notice_attempts_for(prior_fails):
     return attempt if attempt >= MAX_FAILS else 0
 
 
-def post_parked(owner, repo, pr, rounds, token):
-    body = (
-        f"## 🤖 {PARK_MARKER}\n\n"
-        f"@{OWNER_HANDLE} I've posted {rounds} automated reviews on this PR — parking "
-        f"further automatic reviews to avoid a review↔fix loop. Merge when ready, or ask "
-        f"me directly (`review-bot-review … --pr {pr}`) for another pass."
-    )
+def count_review_rounds(comments, self_authors, head_sha):
+    """Count self-authored real reviews on the thread -> (head_rounds, total_rounds).
+
+    total_rounds = every comment by us carrying REVIEW_MARKER (the lifetime budget,
+    MAX_TOTAL). head_rounds = the subset whose footer also carries the current head's
+    ``head `<sha12>` `` segment (the per-revision cap, MAX_ROUNDS) — render_markdown
+    stamps it, so manual/direct passes attribute correctly too. Legacy reviews (posted
+    before the head segment existed) count toward the budget but toward no revision's
+    cap. A falsy head_sha degrades to head_rounds == total_rounds — missing data must
+    never loosen the cap. Parked and give-up notices lack REVIEW_MARKER on purpose,
+    so they count toward neither.
+    """
+    head_segment = f"head `{head_sha[:12]}`" if head_sha else None
+    head_rounds = total_rounds = 0
+    for c in comments:
+        if c.get("user", {}).get("login", "").lower() not in self_authors:
+            continue
+        body = c.get("body", "") or ""
+        if REVIEW_MARKER not in body:
+            continue
+        total_rounds += 1
+        if head_segment is None or head_segment in body:
+            head_rounds += 1
+    return head_rounds, total_rounds
+
+
+def post_parked(owner, repo, pr, rounds, token, head_sha="", budget=False):
+    """Post the parked notice — two wordings under the same PARK_MARKER heading.
+
+    Per-revision (default): this exact head has had its MAX_ROUNDS reviews; a push
+    re-arms automatic review. Budget: the PR's lifetime review budget (MAX_TOTAL) is
+    spent; the counter is monotone, so no push re-arms it.
+    """
+    if budget:
+        detail = (
+            f"I've posted {rounds} automated reviews on this PR — parking automatic "
+            f"reviews here; the total-review budget ({MAX_TOTAL}) is spent. Ask me "
+            f"directly (`review-bot-review … --pr {pr}`) if more are needed."
+        )
+    else:
+        detail = (
+            f"I've posted {rounds} automated reviews of `{head_sha[:12]}` — parking "
+            f"further automatic reviews of this revision to avoid a review↔fix loop. "
+            f"Push new commits, or ask me directly (`review-bot-review … --pr {pr}`) "
+            f"for another pass."
+        )
+    body = f"## 🤖 {PARK_MARKER}\n\n@{OWNER_HANDLE} {detail}"
     api("POST", f"repos/{owner}/{repo}/issues/{pr}/comments", token, data={"body": body})
-    log(f"parked {owner}/{repo}#{pr} after {rounds} rounds (pinged @{OWNER_HANDLE})")
+    what = "total-review budget spent" if budget else f"{rounds} rounds on head {head_sha[:12]}"
+    log(f"parked {owner}/{repo}#{pr} ({what}; pinged @{OWNER_HANDLE})")
 
 
 def main():
@@ -328,15 +371,14 @@ def main():
             except urllib.error.HTTPError as e:
                 log(f"skip {slug}#{num}: cannot read comments (HTTP {e.code})")
                 continue
-            review_rounds = 0
+            head_rounds, total_rounds = count_review_rounds(comments, self_authors, head_sha)
             for c in comments:
                 author = c.get("user", {}).get("login", "")
                 body = c.get("body", "") or ""
                 if author.lower() in self_authors:
                     # Our own comment — never react to it (the review footer literally
-                    # contains "@review-bot …" examples). Count real reviews for the cap.
-                    if REVIEW_MARKER in body:
-                        review_rounds += 1
+                    # contains "@review-bot …" examples); count_review_rounds already
+                    # tallied the real reviews for the caps.
                     continue
                 arg = mention_arg(body, handles)
                 if arg is None:
@@ -356,16 +398,25 @@ def main():
             if not triggers:
                 continue
 
-            # Cap: park (once per head SHA) instead of reviewing past MAX_ROUNDS.
-            if review_rounds >= MAX_ROUNDS:
-                pkey = f"p:{slug}#{num}:{head_sha}"
+            # Caps: park instead of reviewing. The lifetime budget (MAX_TOTAL, checked
+            # first — its counter is monotone, so no push can un-trip it) parks once per
+            # PR ever; the per-revision cap (MAX_ROUNDS reviews of the current head)
+            # parks once per head SHA, and a push re-arms automatic review.
+            if total_rounds >= MAX_TOTAL:
+                pkey, rounds, budget = f"pt:{slug}#{num}", total_rounds, True
+            elif head_rounds >= MAX_ROUNDS:
+                pkey, rounds, budget = f"p:{slug}#{num}:{head_sha}", head_rounds, False
+            else:
+                pkey = None
+            if pkey:
                 if not is_done(pkey):
+                    what = "budget spent" if budget else f"{rounds} rounds on this head"
                     if dry:
-                        log(f"[dry-run] would park {slug}#{num} ({review_rounds} rounds) + ping @{OWNER_HANDLE}")
+                        log(f"[dry-run] would park {slug}#{num} ({what}) + ping @{OWNER_HANDLE}")
                     else:
                         try:
-                            post_parked(owner, repo, num, review_rounds, token)
-                            answered[pkey] = {"status": "parked", "rounds": review_rounds}
+                            post_parked(owner, repo, num, rounds, token, head_sha=head_sha, budget=budget)
+                            answered[pkey] = {"status": "parked", "rounds": rounds}
                             save_state(state)
                         except urllib.error.HTTPError as e:
                             log(f"could not post parked notice on {slug}#{num} (HTTP {e.code})")
