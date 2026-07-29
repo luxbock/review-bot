@@ -329,7 +329,7 @@ pulls that feedback back **programmatically** (issue #2). It is a pure READ:
 
 ```
 review-bot-feedback --owner O --repo R (--pr N | --issue N) \
-                    [--json|--markdown] [--all] [--kind review,triage,parked]
+                    [--json|--markdown] [--all] [--kind review,triage,parked,failed]
 ```
 
 Unlike `review-bot-review`, it needs **only a forge READ token** — no LLM
@@ -343,7 +343,9 @@ strictly read-only: it never posts, labels, or closes.
 - A comment counts as review-bot's iff its author login is in the handle set
   (default `review-bot`, `review_bot`; override via `REVIEW_BOT_HANDLES`, same
   as the poller). Each matched comment is classified by its footer marker into
-  a `kind`: `review`, `triage`, `parked`, or `other`.
+  a `kind`: `review`, `triage`, `parked`, `failed`, or `other`. `failed` is a
+  give-up notice — see *When a run gives up* above; a caller filtering kinds for a
+  verdict must include it, or a run that produced no analysis looks like no reply.
 - `--json` (default) emits an envelope:
 
   ```json

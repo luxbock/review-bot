@@ -27,14 +27,17 @@ def fresh_poll():
 class RecordingApi:
     """Stands in for poll.api, capturing every POST body."""
 
-    def __init__(self, fail_times=0):
+    def __init__(self, fail_times=0, code=502):
         self.posts = []
+        self.attempts = 0
         self.fail_times = fail_times
+        self.code = code
 
     def __call__(self, method, path, token, data=None):
+        self.attempts += 1
         if self.fail_times > 0:
             self.fail_times -= 1
-            raise urllib.error.HTTPError(path, 502, "Bad Gateway", {}, None)
+            raise urllib.error.HTTPError(path, self.code, "boom", {}, None)
         self.posts.append((path, (data or {}).get("body", "")))
         return {}
 
@@ -111,6 +114,33 @@ def test_a_failed_post_is_retried_on_the_next_tick():
     print("ok  4. a notice the forge rejected is retried instead of being swallowed")
 
 
+def test_a_permanently_rejected_notice_stops_being_retried():
+    """Nothing prunes the state map and the flush walks all of it every tick, so a
+    rejection that cannot fix itself — 404 (issue deleted), 403 (repo archived, token
+    lost write access) — would otherwise re-POST and re-log forever."""
+    for code in (404, 403, 410):
+        poll = fresh_poll()
+        api = RecordingApi(fail_times=99, code=code)
+        poll.api = api
+        answered = given_up(poll)
+        for _tick in range(5):
+            poll.flush_give_up_notices(answered, "tok")
+        rec = answered["m:acme/widget#7:c1"]
+        assert api.attempts == 1, (code, api.attempts)
+        assert rec["reported"] is True and rec["undeliverable"] == code, (code, rec)
+    # 429 and 5xx stay retryable: those are the transient ones the retry exists for.
+    for code in (429, 500, 503):
+        poll = fresh_poll()
+        api = RecordingApi(fail_times=99, code=code)
+        poll.api = api
+        answered = given_up(poll)
+        for _tick in range(3):
+            poll.flush_give_up_notices(answered, "tok")
+        assert api.attempts == 3, (code, api.attempts)
+        assert "reported" not in answered["m:acme/widget#7:c1"], code
+    print("ok  5. a permanent rejection stops; 429/5xx keep retrying")
+
+
 def test_dry_run_posts_nothing_and_leaves_it_pending():
     poll = fresh_poll()
     api = RecordingApi()
@@ -119,7 +149,7 @@ def test_dry_run_posts_nothing_and_leaves_it_pending():
     poll.flush_give_up_notices(answered, "tok", dry=True)
     assert api.posts == [], api.posts
     assert "reported" not in answered["m:acme/widget#7:c1"]
-    print("ok  5. --dry-run reports the intent without posting or marking it delivered")
+    print("ok  6. --dry-run reports the intent without posting or marking it delivered")
 
 
 def test_only_unreported_give_ups_are_flushed():
@@ -137,7 +167,7 @@ def test_only_unreported_give_ups_are_flushed():
     }
     poll.flush_give_up_notices(answered, "tok")
     assert api.posts == [], api.posts
-    print("ok  6. done/failing/parked/already-reported/legacy records are left alone")
+    print("ok  7. done/failing/parked/already-reported/legacy records are left alone")
 
 
 def test_issue_triage_give_up_names_the_issue():
@@ -151,7 +181,7 @@ def test_issue_triage_give_up_names_the_issue():
     assert path == "repos/acme/widget/issues/11/comments", path
     assert "nothing here was triaged" in body, body
     assert "I tried to triage this" in body and "--issue 11" in body, body
-    print("ok  7. an issue triage give-up is reported on the issue, in triage wording")
+    print("ok  8. an issue triage give-up is reported on the issue, in triage wording")
 
 
 def test_feedback_classifies_the_notice_as_failed():
@@ -170,7 +200,7 @@ def test_feedback_classifies_the_notice_as_failed():
     assert feedback.FAIL_MARKER == poll.FAIL_MARKER, (feedback.FAIL_MARKER, poll.FAIL_MARKER)
     assert feedback.classify(body) == "failed", feedback.classify(body)
     assert "failed" in feedback.KINDS, feedback.KINDS
-    print("ok  8. review-bot-feedback classifies the notice as `failed`, not `other`")
+    print("ok  9. review-bot-feedback classifies the notice as `failed`, not `other`")
 
 
 def main():
@@ -179,6 +209,7 @@ def main():
         test_give_up_posts_exactly_one_notice,
         test_the_notice_says_nothing_was_reviewed_and_is_not_a_review,
         test_a_failed_post_is_retried_on_the_next_tick,
+        test_a_permanently_rejected_notice_stops_being_retried,
         test_dry_run_posts_nothing_and_leaves_it_pending,
         test_only_unreported_give_ups_are_flushed,
         test_issue_triage_give_up_names_the_issue,

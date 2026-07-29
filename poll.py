@@ -304,7 +304,17 @@ def flush_give_up_notices(answered, token, dry=False):
             post_failed(n["owner"], n["repo"], n["num"], n["fails"], n["reason"], n["mode"], token)
             rec["reported"] = True
         except urllib.error.HTTPError as e:
-            log(f"could not post give-up notice for {key} (HTTP {e.code}) — retrying next tick")
+            # Retry only what can plausibly succeed later. Nothing prunes `answered`, and
+            # this walks the whole map every tick independently of the repo list, so a
+            # permanent rejection — 404 (issue deleted), 403 (repo archived, or the token
+            # lost write access) — would re-POST and re-log forever. post_parked can
+            # swallow every code alike because it only re-attempts while the PR is still
+            # open at that head SHA; this has no such terminating condition.
+            if e.code == 429 or e.code >= 500:
+                log(f"could not post give-up notice for {key} (HTTP {e.code}) — retrying next tick")
+            else:
+                rec["reported"], rec["undeliverable"] = True, e.code
+                log(f"give-up notice for {key} is undeliverable (HTTP {e.code}) — not retrying")
 
 
 def main():
