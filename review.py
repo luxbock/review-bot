@@ -899,14 +899,22 @@ def _fill_diag(diag, **fields):
 
 
 def empty_finder_is_genuine(parse, mode):
-    """Did the engine really answer with an empty result list, or did normalize() default
-    its way there? An explicit `findings` list is the universal tell. A `verdict` is
-    required evidence in PR mode only: the audit schema carries none by design
-    (AUDIT_SCHEMA_HINT, normalize_audit), so demanding one there inverts the signal and
-    reports every clean audit as a parse pathology."""
-    if not parse or parse.get("findings_kind") != "list":
+    """Did the engine really answer with an empty result, or did normalize() default its
+    way there? Either tell is sufficient, and each mode has its own:
+
+    - an explicit empty `findings` list — the universal one; the audit schema has nothing
+      else, since it carries no `verdict` by design (AUDIT_SCHEMA_HINT, normalize_audit),
+      so demanding one there would report every clean audit as a parse pathology;
+    - a RECOGNISED `verdict`, in PR mode. Requiring the list as well would flag the common
+      shorthand {"verdict":"approve","summary":…} — a real approve with the empty array
+      left out — as a pathology, sending a reader after a bug that is not there. Checking
+      the value rather than mere presence is what keeps a quoted schema
+      ("approve|comment|request_changes") from passing as an answer."""
+    if not parse:
         return False
-    return bool(parse.get("verdict_present")) or mode == "repo"
+    if parse.get("findings_kind") == "list":
+        return True
+    return mode != "repo" and parse.get("verdict_raw") in VERDICT_LABEL
 
 
 def log_empty_finder_diagnostic(harness, diag):

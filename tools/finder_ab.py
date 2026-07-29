@@ -83,6 +83,9 @@ DIFF_LOG_RE = re.compile(r"diff (\d+) chars vs cap (\d+) — ")
 # explainable from the record instead of only reproducible by re-running.
 EMPTY_DIAG_RE = re.compile(r"empty-finder diagnostic: (\{.*\})\s*$", re.MULTILINE)
 EMPTY_DIAG_UNPARSED_LIMIT = 4000
+# review.py's VERDICT_LABEL keys, mirrored for the same reason describe_empty_diag mirrors
+# empty_finder_is_genuine: this tool drives the built binary and cannot import review.py.
+VERDICT_VALUES = ("approve", "comment", "request_changes")
 
 
 def die(msg, code=1) -> NoReturn:
@@ -284,9 +287,10 @@ def describe_empty_diag(record):
     mode = diag.get("mode", "pr")
     # Mirrors review.py's empty_finder_is_genuine. Duplicated rather than imported: this
     # tool drives the BUILT binary, and review.py in-tree carries build placeholders.
-    # A `verdict` is evidence in PR mode only — the audit schema carries none by design.
-    genuine = parse.get("findings_kind") == "list" and (
-        parse.get("verdict_present") or mode == "repo"
+    # Either tell suffices — an explicit empty list, or (PR mode only, since the audit
+    # schema carries none) a recognised verdict value.
+    genuine = parse.get("findings_kind") == "list" or (
+        mode != "repo" and parse.get("verdict_raw") in VERDICT_VALUES
     )
     label = "genuine empty result" if genuine else "DEFAULTED — not a real result object"
     verdict = ("verdict n/a (audit schema)" if mode == "repo"

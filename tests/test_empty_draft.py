@@ -413,6 +413,22 @@ def test_genuine_empty_verdict_is_recorded_as_genuine():
     print("ok  6. genuine empty verdict: diagnostic records an explicit approve")
 
 
+def test_verdict_only_approve_is_genuine_not_a_pathology():
+    """{"verdict":"approve","summary":…} with the empty array left out is a real approve.
+    Flagging it would send a reader after a parse bug that is not there."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_pr_case(
+            tmp, [{"verdict": "approve", "summary": "Nothing to flag."}]
+        )
+    assert calls == 1, calls
+    assert "findings `claude 0\u21920`" in markdown, markdown
+    diag = empty_finder_diag(err)
+    assert diag["parse"]["findings_kind"] == "missing", diag
+    assert diag["parse"]["verdict_raw"] == "approve", diag
+    assert "genuine empty result" in err and "DEFAULTED" not in err, err
+    print("ok  7. a verdict-only approve counts as genuine, not as a parse pathology")
+
+
 def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
     with scratch_dir() as tmp:
         markdown, calls, err = run_pr_case(tmp, [DEGENERATE_PROSE])
@@ -430,7 +446,7 @@ def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
     assert parse["keys"] == ["file", "line_start", "severity"], parse
     assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
     assert "DEFAULTED — not a real result object" in err, err
-    print("ok  7. degenerate parse renders identically but is recorded as defaulted")
+    print("ok  8. degenerate parse renders identically but is recorded as defaulted")
 
 
 GOOD_TRIAGE = {
@@ -516,15 +532,24 @@ def test_unrecognised_triage_disposition_counts_as_defaulted():
 def test_genuine_check_is_mode_aware():
     """The one signal this diagnostic exists to give must not invert between modes."""
     review = fresh_review()
-    audit_clean = {"findings_kind": "list", "verdict_present": False}
-    pr_clean = {"findings_kind": "list", "verdict_present": True}
-    scraped = {"findings_kind": "missing", "verdict_present": False}
-    # An audit reply legitimately carries no verdict; a PR reply that lacks one was
-    # defaulted into existence by normalize().
-    assert review.empty_finder_is_genuine(audit_clean, "repo") is True
-    assert review.empty_finder_is_genuine(audit_clean, "pr") is False
-    assert review.empty_finder_is_genuine(pr_clean, "pr") is True
-    # A missing findings list is never genuine, in either mode.
+    empty_list = {"findings_kind": "list", "verdict_present": False, "verdict_raw": None}
+    # The common shorthand: a real approve with the empty array left out.
+    verdict_only = {"findings_kind": "missing", "verdict_present": True,
+                    "verdict_raw": "approve"}
+    # A quoted schema is present but is not an answer.
+    schema_echo = {"findings_kind": "missing", "verdict_present": True,
+                   "verdict_raw": "approve|comment|request_changes"}
+    scraped = {"findings_kind": "missing", "verdict_present": False, "verdict_raw": None}
+    # An explicit empty list is the universal tell — the audit schema has nothing else.
+    assert review.empty_finder_is_genuine(empty_list, "repo") is True
+    assert review.empty_finder_is_genuine(empty_list, "pr") is True
+    # A recognised verdict stands alone in PR mode, but the audit schema carries none,
+    # so it can never be the evidence there.
+    assert review.empty_finder_is_genuine(verdict_only, "pr") is True
+    assert review.empty_finder_is_genuine(verdict_only, "repo") is False
+    # Present but not a value: checking presence alone would pass this.
+    assert review.empty_finder_is_genuine(schema_echo, "pr") is False
+    # Neither tell, in either mode.
     assert review.empty_finder_is_genuine(scraped, "repo") is False
     assert review.empty_finder_is_genuine(scraped, "pr") is False
     assert review.empty_finder_is_genuine({}, "pr") is False
@@ -549,6 +574,7 @@ def main():
         test_empty_repo_audit_skips_verify_and_has_footer,
         test_green_nonempty_verdict_keeps_body_and_footer,
         test_genuine_empty_verdict_is_recorded_as_genuine,
+        test_verdict_only_approve_is_genuine_not_a_pathology,
         test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted,
         test_raw_excerpt_clips_head_and_tail,
         test_good_triage_journals_nothing,
