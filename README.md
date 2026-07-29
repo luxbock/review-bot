@@ -100,8 +100,11 @@ well-formed reply, which is nearly all traffic.
 
 `poll.py` retries a failing trigger up to `REVIEW_BOT_MAX_FAILS` (3) and then stops. The
 thread now hears about it instead of falling silent: on the **final** automatic attempt
-the poller passes `--post-failure-notice N`, and if that run aborts, `review-bot-review`
-itself posts the give-up comment in-band, at the moment `die()` fires:
+the poller passes `--post-failure-notice N` to `review-bot-review` (the socket client),
+which forwards it as the `post_failure_notice` request field; the service arms the
+notice and posts the give-up comment in-band from its failure handler when the run
+aborts. (`review-bot-review-local`, the direct in-process CLI, posts it at the moment
+`die()` fires — same flag, same comment.)
 
 > ## 🤖 review-bot — could not complete
 > @olli I tried to review this 3 time(s) and could not produce a usable result, so
@@ -330,6 +333,7 @@ Fields are whitelisted (an unknown field is a hard error):
 | `focus`          | str  | free text, capped at 2000 chars                |
 | `print_only`     | bool | return markdown instead of posting             |
 | `dry_run`        | bool | print prompts to the journal, run no engines   |
+| `post_failure_notice` | int | ≥ 0; if the run aborts, post one in-band give-up comment disclosing this attempt count. Not valid for `repo`; the client omits it when 0 (see *When a run gives up*) |
 
 Deliberately **not** accepted: `repo_dir` (the service must not read arbitrary
 caller paths) and engine-command overrides (`REVIEW_BOT_CLAUDE_CMD` /

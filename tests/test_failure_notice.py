@@ -14,10 +14,13 @@ Run:  python3 tests/test_failure_notice.py
 import contextlib
 import importlib.util
 import io
+import json
 import os
+import runpy
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SERVE_PATH = os.path.join(REPO_ROOT, "serve.py")
 
 
 def load_module(name, path):
@@ -35,18 +38,23 @@ def fresh_poll():
     return load_module("poll_failure_notice_test", os.path.join(REPO_ROOT, "poll.py"))
 
 
-class RecordingApi:
-    """Stands in for review.api, capturing every POST body."""
+def fresh_client():
+    return load_module("client_failure_notice_test", os.path.join(REPO_ROOT, "client.py"))
 
-    def __init__(self, explode=False):
+
+class RecordingApi:
+    """Stands in for review.api, capturing every POST body. `explode` is the exception
+    instance a delivery attempt raises: SystemExit(1) mimics the CLI path (api() ->
+    die() -> sys.exit), a plain Exception mimics the serve path (die() rebound to raise
+    ReviewFailure)."""
+
+    def __init__(self, explode=None):
         self.posts = []
         self.explode = explode
 
     def __call__(self, method, path, token, data=None):
-        if self.explode:
-            # The real api() reacts to an HTTP error by calling die(), which raises
-            # SystemExit — reproduce that exact failure shape.
-            raise SystemExit(1)
+        if self.explode is not None:
+            raise self.explode
         self.posts.append((method, path, token, data))
         return {"html_url": "http://forge.example/c/1"}
 
@@ -111,7 +119,7 @@ def test_unarmed_die_posts_nothing():
 
 def test_notice_fires_once_and_swallows_its_own_delivery_failure():
     review = fresh_review()
-    rec = RecordingApi(explode=True)
+    rec = RecordingApi(explode=SystemExit(1))
     review.api = rec
     review.arm_failure_notice("acme", "widget", 7, "pr", 3, "tok")
     err = io.StringIO()
@@ -122,7 +130,7 @@ def test_notice_fires_once_and_swallows_its_own_delivery_failure():
     assert review.FAILURE_NOTICE is None
     assert "could not post the failure notice" in err.getvalue(), err.getvalue()
     # A later die() in the same process (cleanup) must not re-attempt.
-    rec.explode = False
+    rec.explode = None
     with contextlib.redirect_stderr(io.StringIO()):
         expect_exit(lambda: review.die("cleanup failure"))
     assert rec.posts == [], rec.posts
@@ -206,6 +214,98 @@ def test_poll_passes_flag_on_final_attempt_only():
     print("ok  7. poll passes --post-failure-notice on the final attempt only")
 
 
+def test_poll_argv_is_accepted_by_the_shipped_client():
+    """poll dispatches through review-bot-review, which is client.py, NOT review.py —
+    the flag must survive the whole shipped path: poll argv -> client argparse ->
+    request field. An unrecognized flag would SystemExit(2) out of client.main() here."""
+    poll = fresh_poll()
+    client = fresh_client()
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "url"
+        stderr = ""
+
+    poll.subprocess.run = lambda cmd, capture_output, text: calls.append(cmd) or _Proc()
+    with contextlib.redirect_stderr(io.StringIO()):
+        poll.run_review("acme", "widget", 7, "claude", "standard", "", "", notice_attempts=3)
+        poll.run_review("acme", "widget", 7, "claude", "standard", "", "")
+
+    real_build = client.build_request
+    captured = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_build(args):
+        captured.append(args)
+        raise _Stop()
+
+    client.build_request = fake_build
+    for argv in calls:
+        old = sys.argv
+        sys.argv = ["review-bot-review"] + argv[1:]
+        try:
+            try:
+                client.main()
+            except _Stop:
+                pass
+        finally:
+            sys.argv = old
+
+    with_flag = real_build(captured[0])
+    without = real_build(captured[1])
+    assert with_flag["post_failure_notice"] == 3, with_flag
+    # Omitted when unset: the common request stays byte-identical to the old protocol.
+    assert "post_failure_notice" not in without, without
+    print("ok  8. poll's exact argv crosses the shipped client into the request field")
+
+
+def test_serve_validates_and_threads_the_request_field():
+    serve = runpy.run_path(SERVE_PATH, run_name="serve_failure_notice_test")
+    review = fresh_review()
+    base = {"owner": "acme", "repo": "widget", "number": 7}
+
+    args, _h, _b, _f = serve["parse_request"](
+        json.dumps(base | {"post_failure_notice": 3}), review
+    )
+    assert args.post_failure_notice == 3
+    args, _h, _b, _f = serve["parse_request"](json.dumps(base), review)
+    assert args.post_failure_notice == 0
+
+    bad_requests = [
+        base | {"post_failure_notice": -1},
+        base | {"post_failure_notice": True},
+        base | {"post_failure_notice": "3"},
+        {"owner": "acme", "repo": "widget", "mode": "repo", "post_failure_notice": 1},
+    ]
+    for req in bad_requests:
+        try:
+            serve["parse_request"](json.dumps(req), review)
+        except serve["RequestError"]:
+            continue
+        raise AssertionError(f"accepted: {req}")
+
+    # The serve failure contract: die() is rebound to raise ReviewFailure (an
+    # Exception), and the handler calls _post_failure_notice(error) — a delivery
+    # failure raising through the rebound die() must be swallowed, and the call is a
+    # no-op once disarmed.
+    rec = RecordingApi(explode=RuntimeError("rebound die"))
+    review.api = rec
+    review.arm_failure_notice("acme", "widget", 7, "pr", 3, "tok")
+    with contextlib.redirect_stderr(io.StringIO()):
+        review._post_failure_notice("engine died")  # swallowed, disarms
+        review._post_failure_notice("engine died")  # no-op
+    assert rec.posts == [] and review.FAILURE_NOTICE is None
+    rec.explode = None
+    review.arm_failure_notice("acme", "widget", 7, "pr", 3, "tok")
+    with contextlib.redirect_stderr(io.StringIO()):
+        review._post_failure_notice("engine died")
+    assert len(rec.posts) == 1, rec.posts
+    print("ok  9. serve validates the field and its failure handler delivers the notice")
+
+
 def main():
     tests = [
         test_armed_die_posts_one_notice_headline_only,
@@ -215,6 +315,8 @@ def main():
         test_successful_post_disarms,
         test_main_arms_only_for_poller_shaped_invocations,
         test_poll_passes_flag_on_final_attempt_only,
+        test_poll_argv_is_accepted_by_the_shipped_client,
+        test_serve_validates_and_threads_the_request_field,
     ]
     for test in tests:
         test()
