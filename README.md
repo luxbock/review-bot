@@ -88,14 +88,21 @@ head+tail excerpt of it (4000 chars, with the elided count stated), whether the
 JSON-repair retry fired, and — the discriminator — the *pre-normalization* facts
 `verdict_present`, `verdict_raw`, `findings_kind`, `findings_len`, `keys` and the
 `path` by which the JSON was reached, plus the `mode` that ran. Case 1 shows
-`verdict_present: true` with `findings_kind: "list"`; case 2 shows the keys of whatever
-was actually scraped.
+`findings_kind: "list"` with `findings_len: 0` (or, in PR mode, a recognised `verdict_raw`
+and no `findings` key); case 2 shows the keys of whatever was actually scraped.
 
-The discriminator follows the schema of the mode that ran. An explicit `findings` list is
-the universal tell; a `verdict` is required evidence in **PR mode only**, because the
-audit schema carries none by design (`AUDIT_SCHEMA_HINT`, `normalize_audit`). Demanding
-one everywhere would report every clean repo audit as a parse pathology — a false alarm in
-the single signal this diagnostic exists to give.
+The discriminator follows the schema of the mode that ran, and **either tell suffices**:
+
+- an **explicitly empty** `findings` list — the universal one, and the audit schema's only
+  one, since it carries no `verdict` by design (`AUDIT_SCHEMA_HINT`, `normalize_audit`);
+  demanding a verdict there would report every clean repo audit as a parse pathology. The
+  list must have been empty as sent: `normalize*` silently drops non-dict entries, so a
+  list that was non-empty and still reached zero drafts is manufacturing, not answering,
+  and the journal line says `list of N — every entry discarded by normalize`.
+- in **PR mode**, a **recognised** `verdict` value with no `findings` key at all, so the
+  common shorthand `{"verdict":"approve","summary":…}` is not flagged. The *value* is
+  checked rather than mere presence, which keeps a quoted schema
+  (`"approve|comment|request_changes"`) from passing as an answer.
 Under `review-bot-serve` these land in the service journal; `poll.py` discards a
 successful review's stderr, so read the service unit, not the poller.
 

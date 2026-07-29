@@ -639,11 +639,19 @@ def test_finder_ab_stores_the_empty_finder_diagnostic():
     # The classifier follows the schema of the mode that ran. finder_ab only ever drives
     # --mode pr, but a verdict-keyed check would call every clean AUDIT a parse pathology.
     audit_clean = {"empty_finder_diag": {"mode": "repo", "parse": {
-        "findings_kind": "list", "verdict_present": False, "verdict_raw": None,
+        "findings_kind": "list", "findings_len": 0,
+        "verdict_present": False, "verdict_raw": None,
         "path": "envelope-result", "keys": ["findings", "summary"]}}}
     described_audit = mod.describe_empty_diag(audit_clean)
     assert described_audit.startswith("genuine empty result"), described_audit
     assert "verdict n/a (audit schema)" in described_audit, described_audit
+    # A list that arrived non-empty means normalize discarded its entries — not genuine,
+    # and the count has to show, since `list` alone reads identically to the clean case.
+    audit_discarded = {"empty_finder_diag": {"mode": "repo", "parse": dict(
+        audit_clean["empty_finder_diag"]["parse"], findings_len=2)}}
+    described_discarded = mod.describe_empty_diag(audit_discarded)
+    assert described_discarded.startswith("DEFAULTED"), described_discarded
+    assert "list of 2 — every entry discarded by normalize" in described_discarded, described_discarded
     print("ok 11. finder_ab: empty runs keep the reviewer's diagnostic and are classified")
 
 

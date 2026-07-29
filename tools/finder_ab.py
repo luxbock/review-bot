@@ -287,16 +287,20 @@ def describe_empty_diag(record):
     mode = diag.get("mode", "pr")
     # Mirrors review.py's empty_finder_is_genuine. Duplicated rather than imported: this
     # tool drives the BUILT binary, and review.py in-tree carries build placeholders.
-    # Either tell suffices — an explicit empty list, or (PR mode only, since the audit
-    # schema carries none) a recognised verdict value.
-    genuine = parse.get("findings_kind") == "list" or (
-        mode != "repo" and parse.get("verdict_raw") in VERDICT_VALUES
-    )
+    # Either tell suffices — an EXPLICITLY EMPTY list (a non-empty one that still reached
+    # zero drafts means normalize* discarded its entries), or (PR mode only, since the
+    # audit schema carries none) a recognised verdict with no `findings` key at all.
+    kind, length = parse.get("findings_kind"), parse.get("findings_len")
+    genuine = (length == 0 if kind == "list" else
+               mode != "repo" and kind == "missing"
+               and parse.get("verdict_raw") in VERDICT_VALUES)
     label = "genuine empty result" if genuine else "DEFAULTED — not a real result object"
     verdict = ("verdict n/a (audit schema)" if mode == "repo"
                else f"verdict {parse.get('verdict_raw')!r}")
     retry = ", after a repair retry" if diag.get("repair_retried") else ""
-    return (f"{label}: {verdict}, findings {parse.get('findings_kind')}, "
+    shown = (f"list of {length} — every entry discarded by normalize"
+             if kind == "list" and length else kind)
+    return (f"{label}: {verdict}, findings {shown}, "
             f"via {parse.get('path')}, keys {','.join(parse.get('keys') or []) or '(none)'}"
             f"{retry}")
 

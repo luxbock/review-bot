@@ -898,6 +898,17 @@ def _fill_diag(diag, **fields):
         diag.update(fields)
 
 
+def _describe_findings(parse):
+    """`findings` as the engine sent it. The length matters and is easy to miss: this line
+    is only ever printed when zero drafts survived, so a non-zero length means normalize*
+    discarded every entry — say so instead of printing a bare `list`."""
+    kind = parse.get("findings_kind", "(none)")
+    length = parse.get("findings_len")
+    if kind != "list" or not length:
+        return kind
+    return f"list of {length} — every entry discarded by normalize"
+
+
 def empty_finder_is_genuine(parse, mode):
     """Did the engine really answer with an empty result, or did normalize() default its
     way there? Either tell is sufficient, and each mode has its own:
@@ -905,16 +916,25 @@ def empty_finder_is_genuine(parse, mode):
     - an explicit empty `findings` list — the universal one; the audit schema has nothing
       else, since it carries no `verdict` by design (AUDIT_SCHEMA_HINT, normalize_audit),
       so demanding one there would report every clean audit as a parse pathology;
-    - a RECOGNISED `verdict`, in PR mode. Requiring the list as well would flag the common
-      shorthand {"verdict":"approve","summary":…} — a real approve with the empty array
-      left out — as a pathology, sending a reader after a bug that is not there. Checking
-      the value rather than mere presence is what keeps a quoted schema
-      ("approve|comment|request_changes") from passing as an answer."""
+    - a RECOGNISED `verdict` with NO `findings` key at all, in PR mode. Requiring the list
+      as well would flag the common shorthand {"verdict":"approve","summary":…} — a real
+      approve with the empty array left out — as a pathology, sending a reader after a bug
+      that is not there. Checking the verdict's value rather than mere presence is what
+      keeps a quoted schema ("approve|comment|request_changes") from passing as an answer,
+      and requiring `findings` to be absent rather than merely un-listlike is what stops
+      {"verdict":"approve","findings":[<discarded>]} from hiding a dropped entry."""
     if not parse:
         return False
     if parse.get("findings_kind") == "list":
-        return True
-    return mode != "repo" and parse.get("verdict_raw") in VERDICT_LABEL
+        # An EXPLICITLY empty list. A list that was non-empty and still reached zero
+        # drafts means normalize* discarded every entry (both silently `continue` past a
+        # non-dict), which is manufacturing, not answering — the case this exists to catch.
+        return parse.get("findings_len") == 0
+    return (
+        mode != "repo"
+        and parse.get("findings_kind") == "missing"
+        and parse.get("verdict_raw") in VERDICT_LABEL
+    )
 
 
 def log_empty_finder_diagnostic(harness, diag):
@@ -936,7 +956,7 @@ def log_empty_finder_diagnostic(harness, diag):
         f"EMPTY FINDER ({harness}, {mode} mode): {call}. Zero drafts{retry} "
         f"verify stage skipped. parse-path {parse.get('path', '(unparsed)')}, "
         f"verdict {parse.get('verdict_raw')!r} ({verdict_note}), "
-        f"findings {parse.get('findings_kind', '(none)')}, "
+        f"findings {_describe_findings(parse)}, "
         f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
     )
     log(EMPTY_FINDER_DIAG_PREFIX + json.dumps(diag, sort_keys=True, default=str))
