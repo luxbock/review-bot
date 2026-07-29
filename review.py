@@ -198,7 +198,8 @@ FAIL_MARKER = "review-bot — could not complete"
 # needs to say "this run produced nothing". A module global rather than a parameter
 # because die() is called from every layer of the pipeline and the point is to fire on
 # ANY abort, not just the ones that remembered to thread a context through. The serve
-# path rebinds die() and never arms this, so it is CLI-only by construction.
+# path rebinds die(), so this module's die-hook never fires there; serve arms this
+# explicitly and delivers it from its own failure handlers instead (see serve.py main()).
 FAILURE_NOTICE = None
 
 

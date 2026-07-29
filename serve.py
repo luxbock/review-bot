@@ -19,6 +19,9 @@ Request fields (whitelist — any unknown field is a hard error):
   focus           free text, capped at 2000 chars
   print_only      bool — don't POST the comment, return the markdown only
   dry_run         bool — print prompts to the journal, run no engines
+  post_failure_notice  int >= 0 — if the run aborts, post one in-band give-up
+                  comment disclosing this attempt count (0/absent = no notice;
+                  not valid for mode=repo — no thread to notify)
 
 Deliberately NOT accepted: repo_dir (would let a caller point the service at an
 arbitrary path readable by the service user) and any engine-command override —
