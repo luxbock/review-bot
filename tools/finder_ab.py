@@ -77,6 +77,12 @@ STAGE_RE = re.compile(r"^(\S+) (\d+)→(\d+)$")
 # from "the diff was empty" — a 0-char diff reports `inlined` under ANY cap, since the
 # comparison is `0 <= cap`. Capturing the measured size is what makes that visible.
 DIFF_LOG_RE = re.compile(r"diff (\d+) chars vs cap (\d+) — ")
+# review.py's per-empty-finder journal line. An empty draft is the event this experiment
+# exists to explain, and the footer's `0→0` is silent about WHY the finder came back
+# empty; this carries the engine's own output and how it parsed, so a rare empty cell is
+# explainable from the record instead of only reproducible by re-running.
+EMPTY_DIAG_RE = re.compile(r"empty-finder diagnostic: (\{.*\})\s*$", re.MULTILINE)
+EMPTY_DIAG_UNPARSED_LIMIT = 4000
 
 
 def die(msg, code=1) -> NoReturn:
@@ -243,7 +249,45 @@ def run_once(binary, args, harness, mode_label, cap, run_index, head):
         record["stderr_tail"] = "\n".join((proc.stderr or "").strip().splitlines()[-10:])
     else:
         record["aborted"] = False
+        if parsed["draft_findings"] == 0:
+            record["empty_finder_diag"] = parse_empty_diag(proc.stderr)
+            if record["empty_finder_diag"] is None:
+                # An older binary predates the diagnostic; keep the tail so the run is
+                # still worth something rather than silently indistinguishable.
+                record["stderr_tail"] = "\n".join(
+                    (proc.stderr or "").strip().splitlines()[-20:]
+                )
     return record
+
+
+def parse_empty_diag(stderr):
+    """The reviewer's empty-finder JSON, or None when the line is absent."""
+    m = EMPTY_DIAG_RE.search(stderr or "")
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return {"unparsed": m.group(1)[:EMPTY_DIAG_UNPARSED_LIMIT]}
+
+
+def describe_empty_diag(record):
+    """One line separating the two ways a run reaches zero drafts: the engine answering
+    `approve` with an explicit empty list, versus normalize() defaulting its way there
+    from an object that was never a review."""
+    diag = record.get("empty_finder_diag")
+    if not diag:
+        return "no diagnostic recorded (binary predates it?)"
+    parse = diag.get("parse") or {}
+    if not parse:
+        return "engine output never parsed as JSON"
+    genuine = parse.get("verdict_present") and parse.get("findings_kind") == "list"
+    verdict = parse.get("verdict_raw")
+    label = "genuine empty verdict" if genuine else "DEFAULTED — not a real review object"
+    retry = ", after a repair retry" if diag.get("repair_retried") else ""
+    return (f"{label}: verdict {verdict!r}, findings {parse.get('findings_kind')}, "
+            f"via {parse.get('path')}, keys {','.join(parse.get('keys') or []) or '(none)'}"
+            f"{retry}")
 
 
 def cell_ok(record):
@@ -370,11 +414,21 @@ def main(argv=None):
                     else:
                         log(f"  {record['draft_findings']}→{record['surviving_findings']} "
                             f"({record['diff_mode']}, {record['diff_chars']} chars)")
+                        if record["draft_findings"] == 0:
+                            log(f"  {describe_empty_diag(record)}")
 
     print()
     print(f"{args.owner}/{args.repo}#{args.pr} @ {head[:12]} — depth {args.depth}, "
           f"bar {args.confidence_bar}, {args.runs} run(s) per cell")
     print(summarize(records))
+    empties = [r for r in records if cell_ok(r) and r["draft_findings"] == 0]
+    if empties:
+        print()
+        print(f"empty finders ({len(empties)}) — the raw engine output for each is in "
+              f"{args.out} under `empty_finder_diag`:")
+        for r in empties:
+            print(f"  {r['harness']:6} {r['input_mode']:14} run {r['run']}: "
+                  f"{describe_empty_diag(r)}")
     print()
     print(f"{len(records)} run(s) written to {args.out}")
     return 0

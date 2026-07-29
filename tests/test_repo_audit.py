@@ -345,7 +345,7 @@ def test_all_pipeline_engine_cwds_are_worktree():
         events = []
         calls = []
 
-        def fake_review_via(harness, prompt, cwd, dry_run, mode="pr"):
+        def fake_review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
             assert events and events[0] == "enter"
             assert cwd == wt
             calls.append((harness, cwd, mode))
@@ -372,7 +372,7 @@ def test_checkout_exits_after_generation_and_verification_failures():
             wt = make_git_tree(tmp)
             calls = []
 
-            def failing_review_via(harness, prompt, cwd, dry_run, mode="pr"):
+            def failing_review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
                 assert cwd == wt
                 calls.append(cwd)
                 if len(calls) == fail_call:

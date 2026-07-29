@@ -841,25 +841,98 @@ REFORMAT_INSTRUCTION = (
 )
 
 
+# ── empty-finder diagnostics (issue #21) ──────────────────────────────────────
+# A finder that returns zero drafts skips verification entirely (run_pipeline), so the
+# review renders as clean off a stage that never produced anything. The rendered footer's
+# `0→0` cannot say WHICH of two very different things happened:
+#   1. the engine genuinely answered {"verdict":"approve","findings":[]}, or
+#   2. normalize() manufactured that answer from something else — it defaults a missing
+#      `verdict` to "comment" and a missing/non-list `findings` to [], so an unrelated
+#      JSON fragment scraped out of a prose reply parses as a clean review.
+# Those need opposite fixes, so record the evidence when it happens rather than re-running
+# the pipeline blind afterwards. Journal only: the posted comment is unchanged.
+EMPTY_FINDER_DIAG_PREFIX = "empty-finder diagnostic: "
+EMPTY_FINDER_RAW_LIMIT = 4000
+_MISSING = object()
+
+
+def _clip(text, limit=EMPTY_FINDER_RAW_LIMIT):
+    """Head+tail excerpt: a degenerate reply can hide its tell at either end."""
+    if text is None or len(text) <= limit:
+        return text
+    half = limit // 2
+    return f"{text[:half]}\n…[{len(text) - limit} chars elided]…\n{text[-half:]}"
+
+
+def _describe_parsed(obj, path):
+    """What the PRE-normalization object carried — the part normalize() erases."""
+    if not isinstance(obj, dict):
+        return {"path": path, "type": type(obj).__name__}
+    findings = obj.get("findings", _MISSING)
+    if findings is _MISSING:
+        kind, length = "missing", None
+    elif isinstance(findings, list):
+        kind, length = "list", len(findings)
+    else:
+        kind, length = type(findings).__name__, None
+    verdict = obj.get("verdict", _MISSING)
+    return {
+        "path": path,
+        "keys": sorted(str(k) for k in obj),
+        "verdict_raw": None if verdict is _MISSING else verdict,
+        "verdict_present": verdict is not _MISSING,
+        "findings_kind": kind,
+        "findings_len": length,
+    }
+
+
+def _fill_diag(diag, **fields):
+    if isinstance(diag, dict):
+        diag.update(fields)
+
+
+def log_empty_finder_diagnostic(harness, diag):
+    """Journal what the engine actually emitted, human line first then one JSON line."""
+    diag = diag or {}
+    parse = diag.get("parse") or {}
+    retry = " after a JSON-repair retry," if diag.get("repair_retried") else ""
+    log(
+        f"EMPTY FINDER ({harness}): zero drafts,{retry} verify stage skipped. "
+        f"parse-path {parse.get('path', '(unparsed)')}, "
+        f"verdict {parse.get('verdict_raw')!r} "
+        f"({'present' if parse.get('verdict_present') else 'ABSENT — defaulted'}), "
+        f"findings {parse.get('findings_kind', '(none)')}, "
+        f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
+    )
+    log(EMPTY_FINDER_DIAG_PREFIX + json.dumps(diag, sort_keys=True, default=str))
+
+
 def _parse_engine_output(raw, harness, key, norm):
-    """Raw engine stdout -> (normalized_obj_or_None, inner_text_for_a_repair_retry)."""
-    text = raw
+    """Raw engine stdout -> (normalized_obj_or_None, inner_text_for_a_repair_retry,
+    parse_facts_or_None). The third element records how the JSON was reached and what it
+    carried, for log_empty_finder_diagnostic."""
+    text, path = raw, "raw"
     if harness == "claude":
         # `claude -p --output-format json` wraps the answer in an envelope; the real
         # answer is the `result` string (which should itself be the review JSON).
         try:
             env = json.loads(raw)
             if isinstance(env, dict) and isinstance(env.get("result"), str):
-                text = env["result"]
+                text, path = env["result"], "envelope-result"
             elif isinstance(env, dict) and key in env:
-                return norm(env), text
+                return norm(env), text, _describe_parsed(env, "envelope-direct")
         except json.JSONDecodeError:
-            text = raw
+            text, path = raw, "raw"
     obj = find_json_object(text)
-    return (norm(obj) if obj is not None else None), text
+    if obj is None:
+        return None, text, None
+    return norm(obj), text, _describe_parsed(obj, path)
 
 
-def review_via(harness, prompt, cwd, dry_run, mode="pr"):
+def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
+    """`diag`, when a dict, is filled with the evidence log_empty_finder_diagnostic
+    needs. It is always filled and only sometimes read: whether this call was the finder,
+    and whether it came back empty, is known to the caller and not here."""
     raw = run_engine(harness, prompt, cwd, dry_run=dry_run)
     if dry_run or raw is None:
         return None
@@ -870,8 +943,10 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr"):
     else:
         norm, key = normalize, "verdict"
 
-    result, text = _parse_engine_output(raw, harness, key, norm)
+    _fill_diag(diag, harness=harness, raw_chars=len(raw), raw_excerpt=_clip(raw))
+    result, text, parse = _parse_engine_output(raw, harness, key, norm)
     if result is not None:
+        _fill_diag(diag, repair_retried=False, parse=parse)
         return result
 
     # One JSON-repair retry. Engines occasionally answer in prose despite the prompt's
@@ -880,13 +955,16 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr"):
     # sound. Ask the engine to reformat its own prior output as strict JSON before giving
     # up: cheaper and more faithful than discarding the review or re-generating it.
     log(f"{harness} did not return parseable JSON; attempting one reformat retry")
+    _fill_diag(diag, repair_retried=True)
     schema_hint = {"issue": TRIAGE_SCHEMA_HINT, "repo": AUDIT_SCHEMA_HINT}.get(mode, REVIEW_SCHEMA_HINT)
     repaired = run_engine(
         harness, REFORMAT_INSTRUCTION.format(schema=schema_hint, prior=text[-6000:]), cwd
     )
     if repaired is not None:
-        result, _ = _parse_engine_output(repaired, harness, key, norm)
+        _fill_diag(diag, repair_chars=len(repaired), repair_excerpt=_clip(repaired))
+        result, _text, parse = _parse_engine_output(repaired, harness, key, norm)
         if result is not None:
+            _fill_diag(diag, parse=parse)
             return result
     die(f"could not parse a JSON result from {harness} output (even after a reformat retry):\n{text[-2000:]}")
 
@@ -1069,10 +1147,13 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
     results = []
     stages = []
     for h in harnesses:
-        r = review_via(h, gen_prompt, cdir, False, mode)
+        diag = {}
+        r = review_via(h, gen_prompt, cdir, False, mode, diag=diag)
         draft_count = None
         if r is not None and mode in ("pr", "repo"):
             draft_count = len(r["findings"])
+            if draft_count == 0:
+                log_empty_finder_diagnostic(h, diag)
         should_verify = (
             depth != "quick"
             and r is not None

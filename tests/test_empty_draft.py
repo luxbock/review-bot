@@ -85,7 +85,13 @@ def make_stub_engine(tmpdir, responses):
         f.write("    dst.write(str(index + 1) + '\\n')\n")
         f.write("if index >= len(responses):\n")
         f.write("    raise SystemExit('unexpected extra engine invocation')\n")
-        f.write("sys.stdout.write(json.dumps({'result': json.dumps(responses[index])}))\n")
+        # A response carrying __raw_result__ is emitted verbatim as the claude envelope's
+        # `result` string, which is how a prose (non-JSON) reply actually reaches review.py.
+        f.write("resp = responses[index]\n")
+        f.write("if isinstance(resp, dict) and '__raw_result__' in resp:\n")
+        f.write("    sys.stdout.write(json.dumps({'result': resp['__raw_result__']}))\n")
+        f.write("else:\n")
+        f.write("    sys.stdout.write(json.dumps({'result': json.dumps(resp)}))\n")
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IRWXU)
 
     os.environ["REVIEW_BOT_TEST_RESPONSES"] = responses_path
@@ -192,12 +198,13 @@ def run_pr_case(tmpdir, responses):
         return checkout, base
 
     review.prepare_checkout = prepare
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
         markdown, url = review.do_pr_review(
             _Args(), ["claude"], "medium", "(none provided)", "tok", auth=_Auth()
         )
     assert url is None and checkout.entered and checkout.exited
-    return markdown, invocation_count(count_path)
+    return markdown, invocation_count(count_path), err.getvalue()
 
 
 def run_repo_case(tmpdir, responses):
@@ -209,12 +216,13 @@ def run_repo_case(tmpdir, responses):
     review.prepare_head_checkout = (
         lambda owner, repo, default_branch, auth, repo_dir=None: (checkout, head)
     )
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
         markdown, url = review.do_repo_audit(
             _Args(mode="repo"), ["claude"], "medium", "(none provided)", "tok", auth=None
         )
     assert url is None and checkout.entered and checkout.exited
-    return markdown, invocation_count(count_path)
+    return markdown, invocation_count(count_path), err.getvalue()
 
 
 EMPTY_REVIEW = {"verdict": "approve", "summary": "", "findings": []}
@@ -259,11 +267,30 @@ VERIFIED_ONE = {
     "findings": [REALISTIC_DRAFT["findings"][1]],
 }
 EMPTY_AUDIT = {"summary": "", "findings": []}
+# A prose reply whose only balanced {...} is an unrelated fragment — here the schema the
+# engine was quoting back. find_json_object scrapes it, normalize() defaults the absent
+# verdict and findings, and the run renders as a clean review nobody performed.
+DEGENERATE_PROSE = {
+    "__raw_result__": (
+        "I looked at the change. The schema I was asked to follow is:\n\n"
+        '{"file": "<path>", "line_start": 1, "severity": "minor"}\n\n'
+        "Overall the widget change reads fine to me."
+    )
+}
+
+
+def empty_finder_diag(stderr):
+    """The JSON review.py journals for an empty finder, or None when it did not fire."""
+    prefix = "empty-finder diagnostic: "
+    for line in stderr.splitlines():
+        if prefix in line:
+            return json.loads(line.split(prefix, 1)[1])
+    return None
 
 
 def test_empty_pr_skips_verify_and_discloses():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [EMPTY_REVIEW])
+        markdown, calls, _err = run_pr_case(tmp, [EMPTY_REVIEW])
     assert calls == 1, calls
     expected = (
         "No blocking issues found at or above the **medium** confidence bar.\n\n"
@@ -278,7 +305,7 @@ def test_empty_pr_skips_verify_and_discloses():
 
 def test_two_findings_verified_to_zero():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [REALISTIC_DRAFT, EMPTY_REVIEW])
+        markdown, calls, _err = run_pr_case(tmp, [REALISTIC_DRAFT, EMPTY_REVIEW])
     assert calls == 2, calls
     assert "All 2 draft finding(s) were checked and dropped by the verification stage." in markdown
     assert EMPTY_FINDER_DISCLOSURE not in markdown
@@ -288,7 +315,7 @@ def test_two_findings_verified_to_zero():
 
 def test_degenerate_two_findings_verified_to_one():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [DEGENERATE_DRAFT, VERIFIED_ONE])
+        markdown, calls, _err = run_pr_case(tmp, [DEGENERATE_DRAFT, VERIFIED_ONE])
     assert calls == 2, calls
     assert EMPTY_FINDER_DISCLOSURE not in markdown
     assert "draft finding(s) were checked and dropped" not in markdown
@@ -299,17 +326,20 @@ def test_degenerate_two_findings_verified_to_one():
 
 def test_empty_repo_audit_skips_verify_and_has_footer():
     with scratch_dir() as tmp:
-        markdown, calls = run_repo_case(tmp, [EMPTY_AUDIT])
+        markdown, calls, err = run_repo_case(tmp, [EMPTY_AUDIT])
     assert calls == 1, calls
     assert markdown.startswith("## 🤖 review-bot audit — acme/widget maintainability findings")
     assert "No maintainability findings at or above the **medium** confidence bar." in markdown
     assert "findings `claude 0→0`" in markdown
-    print("ok  4. empty repo audit: one call and audit provenance footer")
+    # The audit pipeline shares run_pipeline, so it gets the same diagnostic.
+    diag = empty_finder_diag(err)
+    assert diag is not None and diag["parse"]["findings_kind"] == "list", diag
+    print("ok  4. empty repo audit: one call, audit provenance footer, diagnostic")
 
 
 def test_green_nonempty_verdict_keeps_body_and_footer():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [VERIFIED_ONE, VERIFIED_ONE])
+        markdown, calls, err = run_pr_case(tmp, [VERIFIED_ONE, VERIFIED_ONE])
     assert calls == 2, calls
     assert markdown.startswith("## 🤖 review-bot — ✅ no blocking issues")
     assert "### Findings (1)" in markdown
@@ -317,7 +347,57 @@ def test_green_nonempty_verdict_keeps_body_and_footer():
     assert EMPTY_FINDER_DISCLOSURE not in markdown
     assert "draft finding(s) were checked and dropped" not in markdown
     assert "findings `claude 1→1`" in markdown
+    # A non-empty finder journals nothing: the diagnostic marks a rare event, so it must
+    # stay rare enough to be worth grepping for.
+    assert empty_finder_diag(err) is None, err
     print("ok  5. green verdict with a finding retains body and gains footer only")
+
+
+def test_genuine_empty_verdict_is_recorded_as_genuine():
+    with scratch_dir() as tmp:
+        _markdown, calls, err = run_pr_case(tmp, [EMPTY_REVIEW])
+    assert calls == 1, calls
+    diag = empty_finder_diag(err)
+    assert diag is not None, err
+    assert diag["harness"] == "claude" and diag["repair_retried"] is False, diag
+    parse = diag["parse"]
+    assert parse["path"] == "envelope-result", parse
+    assert parse["verdict_present"] is True and parse["verdict_raw"] == "approve", parse
+    assert parse["findings_kind"] == "list" and parse["findings_len"] == 0, parse
+    assert parse["keys"] == ["findings", "summary", "verdict"], parse
+    # The excerpt is the untouched engine stdout — the claude envelope, escaping and all.
+    assert diag["raw_excerpt"].startswith('{"result":') and "approve" in diag["raw_excerpt"], diag
+    assert diag["raw_chars"] == len(diag["raw_excerpt"]), diag
+    print("ok  6. genuine empty verdict: diagnostic records an explicit approve")
+
+
+def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_pr_case(tmp, [DEGENERATE_PROSE])
+    assert calls == 1, calls  # the fragment parsed, so no repair retry fired
+    # Indistinguishable from test 6 in the posted comment — same disclosure, same footer.
+    assert EMPTY_FINDER_DISCLOSURE in markdown, markdown
+    assert "findings `claude 0→0`" in markdown
+    diag = empty_finder_diag(err)
+    assert diag is not None, err
+    assert diag["repair_retried"] is False, diag
+    parse = diag["parse"]
+    # …and fully distinguishable in the journal: neither review key was ever present.
+    assert parse["verdict_present"] is False and parse["verdict_raw"] is None, parse
+    assert parse["findings_kind"] == "missing" and parse["findings_len"] is None, parse
+    assert parse["keys"] == ["file", "line_start", "severity"], parse
+    assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
+    print("ok  7. degenerate parse renders identically but is recorded as defaulted")
+
+
+def test_raw_excerpt_clips_head_and_tail():
+    review = fresh_review()
+    long_text = "A" * 3000 + "MIDDLE" + "Z" * 3000
+    clipped = review._clip(long_text, limit=100)
+    assert clipped.startswith("A" * 50) and clipped.endswith("Z" * 50), clipped
+    assert "MIDDLE" not in clipped and "5906 chars elided" in clipped, clipped
+    assert review._clip("short", limit=100) == "short"
+    print("ok  8. raw excerpt keeps both ends and states how much it dropped")
 
 
 def main():
@@ -327,6 +407,9 @@ def main():
         test_degenerate_two_findings_verified_to_one,
         test_empty_repo_audit_skips_verify_and_has_footer,
         test_green_nonempty_verdict_keeps_body_and_footer,
+        test_genuine_empty_verdict_is_recorded_as_genuine,
+        test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted,
+        test_raw_excerpt_clips_head_and_tail,
     ]
     for test in tests:
         test()

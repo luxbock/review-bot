@@ -61,6 +61,35 @@ after its confidence-bar sentence:
 
 If verification instead checks a non-empty draft and removes every finding, the
 review says `All N draft finding(s) were checked and dropped by the verification stage.`
+
+### The empty-finder diagnostic
+
+The disclosure above says *that* the finder was empty; it cannot say **why**, and
+there are two causes needing opposite fixes:
+
+1. the engine genuinely answered `{"verdict":"approve","findings":[]}`, or
+2. `normalize()` manufactured that answer. It defaults an absent `verdict` to
+   `comment` and an absent or non-list `findings` to `[]`, so any balanced
+   `{...}` scraped out of a prose reply — a schema fragment the engine was
+   quoting back, say — parses as a clean, finding-free review with no other trace.
+
+So every empty finder journals what the engine actually emitted (**stderr only** —
+the posted comment is unchanged):
+
+```
+review-bot-review: EMPTY FINDER (claude): zero drafts, verify stage skipped. parse-path
+  envelope-result, verdict 'approve' (present), findings list, top-level keys findings,summary,verdict
+review-bot-review: empty-finder diagnostic: {"harness": "claude", "parse": {…}, "raw_excerpt": "…", …}
+```
+
+The second line is one JSON object: the harness, the raw output size and a
+head+tail excerpt of it (4000 chars, with the elided count stated), whether the
+JSON-repair retry fired, and — the discriminator — the *pre-normalization* facts
+`verdict_present`, `verdict_raw`, `findings_kind`, `findings_len`, `keys` and the
+`path` by which the JSON was reached. Case 1 shows `verdict_present: true` with
+`findings_kind: "list"`; case 2 shows the keys of whatever was actually scraped.
+Under `review-bot-serve` these land in the service journal; `poll.py` discards a
+successful review's stderr, so read the service unit, not the poller.
 Review and audit footers also include a `findings` segment directly after the `bar`
 segment, with each generator harness's draft and surviving counts in pipeline
 order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
@@ -114,6 +143,14 @@ the PR head is re-read before every run and a moved head aborts the experiment
 instead of mixing two diffs into one cell. The summary table has one row per
 cell with the run count, aborted count, number of empty drafts, and the mean
 draft and surviving finding counts.
+
+A run whose finder came back empty additionally carries `empty_finder_diag` — the
+reviewer's own diagnostic (above), lifted off stderr — so a rare empty cell is
+explainable from the record instead of only reproducible by re-running. When the
+line is absent (a binary predating it) the field is `null` and the stderr tail is
+kept in its place; it is never inferred. After the summary table the harness
+prints one line per empty run classifying it as a *genuine empty verdict* or as
+`DEFAULTED — not a real review object`.
 
 **Target a PR whose diff against its merge base is non-empty.** Since #26
 `review.py` prefers the forge-recorded merge base, so a *merged* PR normally

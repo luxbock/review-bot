@@ -338,6 +338,25 @@ if exit_code:
     raise SystemExit(exit_code)
 counts = "claude 0→0" if index % 2 == 0 else "claude 2→1"
 verdict = "✅ no blocking issues" if index % 2 == 0 else "\U0001f4ac comments"
+# review.py journals this for every empty finder. The stub alternates the two shapes it
+# can carry — an explicit approve, and an object normalize() defaulted into a review —
+# because telling those apart is the whole reason the harness stores it.
+diag_shape = os.environ.get("FINDER_AB_TEST_EMPTY_DIAG", "")
+if counts.endswith("0→0") and diag_shape:
+    if index % 4 == 0:
+        parse = {"path": "envelope-result", "keys": ["findings", "summary", "verdict"],
+                 "verdict_raw": "approve", "verdict_present": True,
+                 "findings_kind": "list", "findings_len": 0}
+    else:
+        parse = {"path": "envelope-result", "keys": ["file", "line_start"],
+                 "verdict_raw": None, "verdict_present": False,
+                 "findings_kind": "missing", "findings_len": None}
+    sys.stderr.write(
+        "review-bot-review: empty-finder diagnostic: "
+        + json.dumps({"harness": "claude", "raw_chars": 42, "raw_excerpt": "…",
+                      "repair_retried": False, "parse": parse})
+        + "\n"
+    )
 mode = "file-list" if cap == "1" else "inlined"
 # Mimic review.py's journal line so the harness can record the MEASURED diff size.
 chars = os.environ.get("FINDER_AB_TEST_DIFF_CHARS", "4096")
@@ -591,6 +610,55 @@ def test_finder_ab_refuses_a_cap_that_did_not_take():
     print("ok 10. finder_ab: a forced cap that never reached the reviewer aborts")
 
 
+def test_finder_ab_stores_the_empty_finder_diagnostic():
+    """An empty cell is the experiment's own subject matter. The record must carry WHY the
+    finder came back empty, and the two shapes must not collapse into one another."""
+    with scratch_dir() as tmp:
+        stub, _log = make_stub_binary(tmp)
+        os.environ.pop("FINDER_AB_TEST_EXIT", None)
+        os.environ["FINDER_AB_TEST_EMPTY_DIAG"] = "1"
+        out = os.path.join(tmp, "finder-ab.jsonl")
+        try:
+            rc, table = run_finder_ab(fresh_finder_ab(), stub, out, runs=2)
+        finally:
+            os.environ.pop("FINDER_AB_TEST_EMPTY_DIAG", None)
+        records = read_jsonl(out)
+        mod = fresh_finder_ab()
+    assert rc == 0
+    empties = [r for r in records if r["draft_findings"] == 0]
+    assert len(empties) == 4, records
+    assert all(r.get("empty_finder_diag") for r in empties), empties
+    # Non-empty runs stay clean: the field marks the exceptional case only.
+    assert all("empty_finder_diag" not in r for r in records if r["draft_findings"]), records
+    described = [mod.describe_empty_diag(r) for r in empties]
+    assert sum("genuine empty verdict" in d for d in described) == 2, described
+    assert sum("DEFAULTED" in d for d in described) == 2, described
+    # …and the operator sees it without reaching for jq.
+    assert "empty finders (4)" in table, table
+    assert "DEFAULTED — not a real review object" in table, table
+    print("ok 11. finder_ab: empty runs keep the reviewer's diagnostic and are classified")
+
+
+def test_finder_ab_marks_a_missing_diagnostic_rather_than_faking_one():
+    """An older binary emits no diagnostic. That must read as 'unknown', never as 'genuine'."""
+    with scratch_dir() as tmp:
+        stub, _log = make_stub_binary(tmp)
+        os.environ.pop("FINDER_AB_TEST_EXIT", None)
+        os.environ.pop("FINDER_AB_TEST_EMPTY_DIAG", None)
+        out = os.path.join(tmp, "finder-ab.jsonl")
+        rc, table = run_finder_ab(fresh_finder_ab(), stub, out, runs=1)
+        records = read_jsonl(out)
+        mod = fresh_finder_ab()
+    assert rc == 0
+    empties = [r for r in records if r["draft_findings"] == 0]
+    assert empties and all(r["empty_finder_diag"] is None for r in empties), empties
+    # The stderr tail is kept instead, so the run is still worth something.
+    assert all(r.get("stderr_tail") for r in empties), empties
+    assert all("no diagnostic recorded" in mod.describe_empty_diag(r) for r in empties), empties
+    assert "no diagnostic recorded" in table, table
+    print("ok 12. finder_ab: a missing diagnostic is reported as unknown, not as genuine")
+
+
 def main():
     tests = [
         test_cap_boundary_is_exact,
@@ -603,6 +671,8 @@ def main():
         test_finder_ab_refuses_a_vacuous_zero_char_diff,
         test_finder_ab_records_measured_diff_size,
         test_finder_ab_refuses_a_cap_that_did_not_take,
+        test_finder_ab_stores_the_empty_finder_diagnostic,
+        test_finder_ab_marks_a_missing_diagnostic_rather_than_faking_one,
     ]
     for test in tests:
         test()
