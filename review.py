@@ -851,7 +851,11 @@ REFORMAT_INSTRUCTION = (
 #      JSON fragment scraped out of a prose reply parses as a clean review.
 # Those need opposite fixes, so record the evidence when it happens rather than re-running
 # the pipeline blind afterwards. Journal only: the posted comment is unchanged.
+# Triage has the same hole with a different key: normalize_triage defaults an absent or
+# unrecognised `disposition` to "needs-info", so a scraped fragment becomes a confident,
+# posted disposition. It has no finder stage, so it needs its own trigger and prefix.
 EMPTY_FINDER_DIAG_PREFIX = "empty-finder diagnostic: "
+TRIAGE_DIAG_PREFIX = "defaulted-triage diagnostic: "
 EMPTY_FINDER_RAW_LIMIT = 4000
 _MISSING = object()
 
@@ -876,11 +880,14 @@ def _describe_parsed(obj, path):
     else:
         kind, length = type(findings).__name__, None
     verdict = obj.get("verdict", _MISSING)
+    disposition = obj.get("disposition", _MISSING)
     return {
         "path": path,
         "keys": sorted(str(k) for k in obj),
         "verdict_raw": None if verdict is _MISSING else verdict,
         "verdict_present": verdict is not _MISSING,
+        "disposition_raw": None if disposition is _MISSING else disposition,
+        "disposition_present": disposition is not _MISSING,
         "findings_kind": kind,
         "findings_len": length,
     }
@@ -925,6 +932,34 @@ def log_empty_finder_diagnostic(harness, diag):
         f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
     )
     log(EMPTY_FINDER_DIAG_PREFIX + json.dumps(diag, sort_keys=True, default=str))
+
+
+def triage_disposition_was_defaulted(parse):
+    """Did the POSTED disposition come from the engine, or from us? normalize_triage
+    substitutes `needs-info` both when `disposition` is absent and when it is present but
+    unrecognised, so either case posts a confident disposition nobody produced — the
+    triage analogue of an empty finder rendering as a confident green."""
+    if not parse:
+        return False
+    if not parse.get("disposition_present"):
+        return True
+    return parse.get("disposition_raw") not in DISPOSITIONS
+
+
+def log_defaulted_triage_diagnostic(harness, diag):
+    """Triage has no finder stage and no draft count, so the empty-finder trigger cannot
+    see this. Same evidence, same journal-only sink, different trigger."""
+    diag = diag or {}
+    parse = diag.get("parse") or {}
+    raw = parse.get("disposition_raw")
+    cause = "supplied none" if not parse.get("disposition_present") else f"supplied {raw!r}"
+    retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
+    log(
+        f"DEFAULTED TRIAGE ({harness}): the engine {cause}{retry} normalize_triage posted "
+        f"`needs-info` instead. parse-path {parse.get('path', '(unparsed)')}, "
+        f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
+    )
+    log(TRIAGE_DIAG_PREFIX + json.dumps(diag, sort_keys=True, default=str))
 
 
 def _parse_engine_output(raw, harness, key, norm):
@@ -1174,6 +1209,9 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
             draft_count = len(r["findings"])
             if draft_count == 0:
                 log_empty_finder_diagnostic(h, diag)
+        elif r is not None and mode == "issue":
+            if triage_disposition_was_defaulted(diag.get("parse")):
+                log_defaulted_triage_diagnostic(h, diag)
         should_verify = (
             depth != "quick"
             and r is not None

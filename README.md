@@ -97,6 +97,18 @@ one everywhere would report every clean repo audit as a parse pathology — a fa
 the single signal this diagnostic exists to give.
 Under `review-bot-serve` these land in the service journal; `poll.py` discards a
 successful review's stderr, so read the service unit, not the poller.
+
+**Triage has the same hole with a different key.** `normalize_triage` substitutes
+`needs-info` whenever the engine supplies no `disposition` *or* an unrecognised one, so a
+scraped fragment is posted as a confident triage nobody produced. Triage has no finder
+stage and no draft count, so the empty-finder trigger cannot see it; it gets its own
+trigger and its own line:
+
+```
+review-bot-review: DEFAULTED TRIAGE (claude): the engine supplied none; normalize_triage
+  posted `needs-info` instead. parse-path envelope-result, top-level keys file,line_start
+review-bot-review: defaulted-triage diagnostic: {"harness": "claude", "mode": "issue", …}
+```
 Review and audit footers also include a `findings` segment directly after the `bar`
 segment, with each generator harness's draft and surviving counts in pipeline
 order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The

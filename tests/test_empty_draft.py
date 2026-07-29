@@ -207,6 +207,39 @@ def run_pr_case(tmpdir, responses):
     return markdown, invocation_count(count_path), err.getvalue()
 
 
+def run_issue_case(tmpdir, responses):
+    count_path = make_stub_engine(tmpdir, responses)
+    review = fresh_review()
+    wt, _base, head = make_git_tree(tmpdir)
+    checkout = RecordingCheckout(wt)
+    ISSUE = {
+        "number": 11, "title": "widget returns 0 for None",
+        "body": "Passing None yields 0 instead of an error.",
+        "user": {"login": "olli"}, "labels": [], "state": "open",
+    }
+
+    def fake_api(method, path, token, data=None):
+        if path.endswith("/issues/11"):
+            return ISSUE
+        if path == "repos/acme/widget":
+            return {"default_branch": "main"}
+        raise AssertionError(f"unexpected api path: {path}")
+
+    review.api = fake_api
+    review.api_paged = lambda path, token: []
+    review.prepare_head_checkout = (
+        lambda owner, repo, default_branch, auth, repo_dir=None: (checkout, head)
+    )
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        markdown, url = review.do_issue_triage(
+            _Args(mode="issue", issue=11, pr=None), ["claude"], "medium",
+            "(none provided)", "tok", auth=None,
+        )
+    assert url is None and checkout.entered and checkout.exited
+    return markdown, invocation_count(count_path), err.getvalue()
+
+
 def run_repo_case(tmpdir, responses):
     count_path = make_stub_engine(tmpdir, responses)
     review = fresh_review()
@@ -399,6 +432,71 @@ def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
     assert "DEFAULTED — not a real result object" in err, err
 
 
+GOOD_TRIAGE = {
+    "disposition": "genuine-bug", "confidence": "high",
+    "summary": "None is silently coerced to a valid value.",
+    "assessment": "The new branch erases the caller's distinction between missing and zero.",
+    "grounding": "src/widget.py:2-3", "recommended_action": "Reject None explicitly.",
+}
+# The triage analogue of DEGENERATE_PROSE: prose whose only balanced {...} is a fragment.
+# normalize_triage posts a confident `needs-info` built from nothing.
+DEGENERATE_TRIAGE_PROSE = {
+    "__raw_result__": (
+        "Looking at the issue, the relevant shape is:\n\n"
+        '{"file": "src/widget.py", "line_start": 2}\n\n'
+        "I think this is a real defect worth fixing."
+    )
+}
+
+
+def defaulted_triage_diag(stderr):
+    prefix = "defaulted-triage diagnostic: "
+    for line in stderr.splitlines():
+        if prefix in line:
+            return json.loads(line.split(prefix, 1)[1])
+    return None
+
+
+def test_good_triage_journals_nothing():
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(tmp, [GOOD_TRIAGE, GOOD_TRIAGE])
+    assert calls == 2, calls
+    assert "🐛 genuine bug" in markdown, markdown
+    assert defaulted_triage_diag(err) is None, err
+    print("ok 10. a triage the engine actually produced journals nothing")
+
+
+def test_defaulted_triage_disposition_is_journalled():
+    """normalize_triage substitutes `needs-info` for an absent disposition, so a scraped
+    fragment is posted as a confident triage nobody produced. Triage has no finder stage,
+    so the empty-finder trigger cannot see it."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(tmp, [DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE])
+    # The posted comment is unchanged — this is the failure, and it is still invisible there.
+    assert "review-bot triage" in markdown, markdown
+    diag = defaulted_triage_diag(err)
+    assert diag is not None, err
+    assert diag["mode"] == "issue", diag
+    assert diag["parse"]["disposition_present"] is False, diag
+    assert diag["parse"]["keys"] == ["file", "line_start"], diag
+    assert "I think this is a real defect" in diag["raw_excerpt"], diag
+    assert "DEFAULTED TRIAGE" in err and "supplied none" in err, err
+    print(f"ok 11. an absent triage disposition is journalled ({calls} engine calls)")
+
+
+def test_unrecognised_triage_disposition_counts_as_defaulted():
+    """Present-but-unrecognised is coerced to `needs-info` too, and posts just as confidently."""
+    with scratch_dir() as tmp:
+        bogus = dict(GOOD_TRIAGE, disposition="probably-fine")
+        _markdown, _calls, err = run_issue_case(tmp, [bogus, bogus])
+    diag = defaulted_triage_diag(err)
+    assert diag is not None, err
+    assert diag["parse"]["disposition_present"] is True, diag
+    assert diag["parse"]["disposition_raw"] == "probably-fine", diag
+    assert "supplied 'probably-fine'" in err, err
+    print("ok 12. an unrecognised triage disposition is journalled, not silently coerced")
+
+
 def test_genuine_check_is_mode_aware():
     """The one signal this diagnostic exists to give must not invert between modes."""
     review = fresh_review()
@@ -438,6 +536,9 @@ def main():
         test_genuine_empty_verdict_is_recorded_as_genuine,
         test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted,
         test_raw_excerpt_clips_head_and_tail,
+        test_good_triage_journals_nothing,
+        test_defaulted_triage_disposition_is_journalled,
+        test_unrecognised_triage_disposition_counts_as_defaulted,
         test_genuine_check_is_mode_aware,
     ]
     for test in tests:
