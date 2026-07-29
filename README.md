@@ -55,9 +55,25 @@ Three modes, sharing all the identity/git/engine/post plumbing:
 At `standard` and `deep` depth, each usable finder draft normally goes through
 verification. A zero-finding PR or repo draft skips that no-op engine call and
 stays green, but the PR review makes the stage provenance explicit immediately
-after its confidence-bar sentence:
+after its confidence-bar sentence, **calibrated to the size of the diff it was
+asked about** (the finder is sampled noise — issue #21 measured 2, 2, 0 findings
+on byte-identical input — so one empty sample means more on a small diff than a
+large one). On a small change:
 
-> ⚠️ The finder stage returned no findings, so nothing was verified — this reports an empty finder, not a verified-clean diff.
+> 0 findings on a small change (1 file, +2/-0) — an empty result is typical and consistent with a clean PR. Verification skipped: nothing to verify.
+
+and past either smallness bound (`REVIEW_BOT_SMALL_DIFF_MAX_FILES`, default 5;
+`REVIEW_BOT_SMALL_DIFF_MAX_LINES`, default 200 added+deleted — both inclusive):
+
+> ⚠️ 0 findings on a substantial change (14 files, +610/-230) — empty results are weaker evidence at this size. Treat as not fully reviewed; a second pass can be requested with `@review-bot` or `review-bot-review`.
+
+The raw numbers always render so a consuming agent can apply its own judgment.
+The tiers only reword the disclosure — a tier change can never add findings, and
+neither tier re-rolls the finder. The size comes from the same
+`changed_files_block` measurement the engine's own input comes from; a render
+with no measurement (outside the PR path) keeps the uncalibrated warning
+`⚠️ The finder stage returned no findings, so nothing was verified — this
+reports an empty finder, not a verified-clean diff.`
 
 If verification instead checks a non-empty draft and removes every finding, the
 review says `All N draft finding(s) were checked and dropped by the verification stage.`
@@ -82,8 +98,10 @@ well-formed reply, which is nearly all traffic.
 
 ### When a run gives up
 
-`poll.py` retries a failing trigger up to `REVIEW_BOT_MAX_FAILS` (3) and then stops. It
-now says so in the thread instead of falling silent:
+`poll.py` retries a failing trigger up to `REVIEW_BOT_MAX_FAILS` (3) and then stops. The
+thread now hears about it instead of falling silent: on the **final** automatic attempt
+the poller passes `--post-failure-notice N`, and if that run aborts, `review-bot-review`
+itself posts the give-up comment in-band, at the moment `die()` fires:
 
 > ## 🤖 review-bot — could not complete
 > @olli I tried to review this 3 time(s) and could not produce a usable result, so
@@ -96,13 +114,13 @@ carries no `REVIEW_MARKER`, so it is not counted as a review round, and
 can tell "no analysis happened" apart from a verdict. Only the error headline is relayed;
 the engine output `die()` appends stays in the journal.
 
-Delivery is recorded in the poll state, since a give-up is terminal for its trigger and
-nothing else would reach it again. A rejection that a later tick could plausibly survive —
-`429`, any `5xx`, or `401` (the token expired or was revoked, and `load_token` re-reads it
-every tick) — is retried, up to `REVIEW_BOT_MAX_NOTICE_ATTEMPTS` (10). A rejection that
-cannot fix itself — `404` (issue deleted), `403` (repo archived, or write access lost) —
-is recorded as `undeliverable` and **not** retried, so that notice is lost; nothing prunes
-the state map, so an unbounded retry would re-POST and re-log on every tick forever.
+Delivery is **single-attempt by design**: the reviewer posts once, best-effort, and a
+POST that fails is logged and lost — there is no retry, no delivery state, and nothing
+for a later tick to flush. Earlier (non-final) failures post nothing, so a transient
+error heals on the next tick without spamming the thread. The flag is only ever passed
+by the poller; direct CLI use, `--print-only` and `--dry-run` never post a notice, and
+a run that already posted its verdict disarms the notice so a cleanup failure cannot
+post "nothing was reviewed" under a delivered review.
 
 ### The empty-finder diagnostic
 

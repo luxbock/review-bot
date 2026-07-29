@@ -60,17 +60,13 @@ DEFAULT_HARNESS = os.environ.get("REVIEW_BOT_DEFAULT_HARNESS", "claude")
 MAX_ROUNDS = int(os.environ.get("REVIEW_BOT_MAX_ROUNDS", "3"))
 MAX_PER_RUN = int(os.environ.get("REVIEW_BOT_MAX_PER_RUN", "3"))
 MAX_FAILS = int(os.environ.get("REVIEW_BOT_MAX_FAILS", "3"))
-# Delivery attempts for a give-up notice before it is abandoned. Only a backstop:
-# a permanently rejecting code stops on the first attempt.
-MAX_NOTICE_ATTEMPTS = int(os.environ.get("REVIEW_BOT_MAX_NOTICE_ATTEMPTS", "10"))
 
-# Footer substring present in EVERY real review (not in a parked notice) — used to count
-# review rounds and to recognise our own reviews. Must match render_markdown in review.py.
+# Footer substring present in EVERY real review — used to count review rounds and to
+# recognise our own reviews. Must match render_markdown in review.py. A parked notice
+# and review.py's in-band "could not complete" notice both lack it on purpose, so
+# neither counts toward MAX_ROUNDS.
 REVIEW_MARKER = "Automated review by **review-bot**"
 PARK_MARKER = "review-bot — parked"
-# Deliberately does NOT contain REVIEW_MARKER: a give-up notice is not a review and must
-# not count toward MAX_ROUNDS.
-FAIL_MARKER = "review-bot — could not complete"
 
 
 def log(msg):
@@ -223,7 +219,7 @@ def mention_arg(body, handles):
     return rest.splitlines()[0].strip() if rest.strip() else ""
 
 
-def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr"):
+def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr", notice_attempts=0):
     target = "--pr" if mode == "pr" else "--issue"
     verb = "reviewing" if mode == "pr" else "triaging"
     cmd = [REVIEW_BIN, "--owner", owner, "--repo", repo, "--mode", mode, target, str(num),
@@ -232,24 +228,26 @@ def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr"):
         cmd += ["--confidence-bar", bar]
     if focus:
         cmd += ["--focus", focus]
+    if notice_attempts:
+        # Final automatic attempt: the reviewer posts its own in-band give-up notice if
+        # it aborts (single attempt, no retry — a lost notice is accepted over keeping a
+        # delivery state machine here).
+        cmd += ["--post-failure-notice", str(notice_attempts)]
     log(f"{verb} {owner}/{repo}#{num} (harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r})")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         log(f"review-bot-review failed (rc={proc.returncode}): {proc.stderr.strip()[-500:]}")
-        return False, failure_reason(proc.stderr)
+        return False
     log(f"{mode} done {owner}/{repo}#{num}: {proc.stdout.strip()}")
-    return True, None
+    return True
 
 
-def failure_reason(stderr):
-    """The reviewer's own error headline. die() appends the offending engine output after
-    the first line; that belongs in the journal, not in a public comment, so take the
-    headline only."""
-    for line in (stderr or "").splitlines():
-        if line.startswith("review-bot-review: error:"):
-            return line.split("error:", 1)[1].strip()[:300] or "(no detail)"
-    tail = [ln for ln in (stderr or "").strip().splitlines() if ln.strip()]
-    return tail[-1].strip()[:300] if tail else "(no error detail)"
+def notice_attempts_for(prior_fails):
+    """The reviewer posts its own give-up notice on the FINAL automatic attempt only —
+    earlier failures stay silent so a transient error can heal on the next tick without
+    spamming the thread. Returns the attempt number to disclose, or 0 (no notice)."""
+    attempt = prior_fails + 1
+    return attempt if attempt >= MAX_FAILS else 0
 
 
 def post_parked(owner, repo, pr, rounds, token):
@@ -261,76 +259,6 @@ def post_parked(owner, repo, pr, rounds, token):
     )
     api("POST", f"repos/{owner}/{repo}/issues/{pr}/comments", token, data={"body": body})
     log(f"parked {owner}/{repo}#{pr} after {rounds} rounds (pinged @{OWNER_HANDLE})")
-
-
-def post_failed(owner, repo, num, fails, reason, mode, token):
-    """Report a give-up in the thread. Until this existed a run that could not produce a
-    result posted NOTHING, and callers waiting on a reply — agents poll their own PRs for
-    one — blocked indefinitely on a comment that was never coming. Carries no REVIEW_MARKER,
-    so it is not counted as a review round."""
-    what, past = ("review", "reviewed") if mode == "pr" else ("triage", "triaged")
-    body = (
-        f"## 🤖 {FAIL_MARKER}\n\n"
-        f"@{OWNER_HANDLE} I tried to {what} this {fails} time(s) and could not produce a "
-        f"usable result, so **nothing here was {past}**. This is not an approval and not "
-        f"a clean bill of health — no analysis was performed.\n\n"
-        f"Reason: `{reason}`\n\n"
-        f"Automatic attempts have stopped. Ask me directly "
-        f"(`review-bot-review … --{'pr' if mode == 'pr' else 'issue'} {num}`) to retry."
-    )
-    api("POST", f"repos/{owner}/{repo}/issues/{num}/comments", token, data={"body": body})
-    log(f"reported give-up on {owner}/{repo}#{num} after {fails} failure(s)")
-
-
-def record_give_up(rec, owner, repo, num, mode, reason):
-    """Attach everything post_failed needs to the state record. Kept separate from delivery
-    because a give-up is terminal for its trigger — is_done() skips it from the next tick
-    on — so a notice that fails to POST has no other chance to be reconstructed."""
-    rec["notice"] = {
-        "owner": owner, "repo": repo, "num": num, "mode": mode,
-        "fails": rec.get("fails", 0), "reason": reason or "(no error detail)",
-    }
-
-
-def flush_give_up_notices(answered, token, dry=False):
-    """Deliver every recorded give-up notice that has not reached the forge yet. Runs at the
-    give-up itself and again at the start of each tick, so a transient HTTP failure retries
-    instead of leaving a caller waiting on a comment that is never coming."""
-    for key, rec in answered.items():
-        if rec.get("status") != "given-up" or rec.get("reported") or not rec.get("notice"):
-            continue
-        n = rec["notice"]
-        if dry:
-            log(f"[dry-run] would report give-up on {n['owner']}/{n['repo']}#{n['num']}")
-            continue
-        try:
-            post_failed(n["owner"], n["repo"], n["num"], n["fails"], n["reason"], n["mode"], token)
-            rec["reported"] = True
-        except urllib.error.HTTPError as e:
-            # Retry only what can plausibly succeed later. Nothing prunes `answered`, and
-            # this walks the whole map every tick independently of the repo list, so a
-            # permanent rejection — 404 (issue deleted), 403 (repo archived, or the token
-            # lost write access) — would re-POST and re-log forever. post_parked can
-            # swallow every code alike because it only re-attempts while the PR is still
-            # open at that head SHA; this has no such terminating condition.
-            # 401 belongs with the transient codes: it means the token expired or was
-            # revoked, load_token() re-reads the file every tick (each tick is a fresh
-            # process), so a rotation genuinely fixes it — and a dead token is exactly
-            # when this fires, since run_review cannot post either, so every trigger
-            # marches to MAX_FAILS. Unlike a 404 it says nothing about the target.
-            attempts = rec["notice_attempts"] = rec.get("notice_attempts", 0) + 1
-            if e.code not in (401, 429) and e.code < 500:
-                rec["reported"], rec["undeliverable"] = True, e.code
-                log(f"give-up notice for {key} is undeliverable (HTTP {e.code}) — not retrying")
-            elif attempts >= MAX_NOTICE_ATTEMPTS:
-                # Backstop: nothing prunes `answered`, so even a retryable code needs a
-                # terminating condition or a never-rotated token re-POSTs forever.
-                rec["reported"], rec["undeliverable"] = True, e.code
-                log(f"giving up on the give-up notice for {key} after {attempts} attempts "
-                    f"(last HTTP {e.code})")
-            else:
-                log(f"could not post give-up notice for {key} (HTTP {e.code}, attempt "
-                    f"{attempts}/{MAX_NOTICE_ATTEMPTS}) — retrying next tick")
 
 
 def main():
@@ -369,11 +297,6 @@ def main():
 
     state = load_state()
     answered = state["answered"]
-    # Retry any notice that did not reach the forge on an earlier tick, before the scan —
-    # its trigger is `given-up`, so nothing below will reach it again.
-    flush_give_up_notices(answered, token, dry)
-    if not dry:
-        save_state(state)
 
     def is_done(key):
         st = answered.get(key, {}).get("status")
@@ -458,7 +381,8 @@ def main():
                 log(f"[dry-run] would review {slug}#{num}: harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r} (trigger {key})")
                 reviews_done += 1
                 continue
-            ok, reason = run_review(owner, repo, num, harness, depth, bar, focus)
+            ok = run_review(owner, repo, num, harness, depth, bar, focus,
+                            notice_attempts=notice_attempts_for(answered.get(key, {}).get("fails", 0)))
             if ok:
                 answered[key] = {"status": "done", "sha": head_sha}
                 reviews_done += 1
@@ -468,15 +392,9 @@ def main():
                 rec["status"] = "given-up" if rec["fails"] >= MAX_FAILS else "failing"
                 answered[key] = rec
                 if rec["status"] == "given-up":
+                    # The reviewer posted its own in-band notice on this final attempt
+                    # (or logged why it could not — accepted single-attempt loss).
                     log(f"giving up on {key} after {rec['fails']} failures")
-                    record_give_up(rec, owner, repo, num, "pr", reason)
-                    # Persist the give-up BEFORE attempting delivery. api() raises a bare
-                    # TimeoutError/URLError on a transport failure, neither of which is an
-                    # HTTPError, so it escapes the flush and kills the tick — leaving the
-                    # `fails` increment unsaved and costing a full re-review next tick. The
-                    # notice is already on the record, so the top-of-tick flush delivers it.
-                    save_state(state)
-                    flush_give_up_notices(answered, token)
             save_state(state)
 
         # ── open ISSUES: @review-bot mentions → triage (mode=issue) ────────────
@@ -523,7 +441,8 @@ def main():
                 log(f"[dry-run] would triage {slug}#{num}: harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r} (trigger {key})")
                 reviews_done += 1
                 continue
-            ok, reason = run_review(owner, repo, num, harness, depth, bar, focus, mode="issue")
+            ok = run_review(owner, repo, num, harness, depth, bar, focus, mode="issue",
+                            notice_attempts=notice_attempts_for(answered.get(key, {}).get("fails", 0)))
             if ok:
                 answered[key] = {"status": "done"}
                 reviews_done += 1
@@ -533,15 +452,9 @@ def main():
                 rec["status"] = "given-up" if rec["fails"] >= MAX_FAILS else "failing"
                 answered[key] = rec
                 if rec["status"] == "given-up":
+                    # The reviewer posted its own in-band notice on this final attempt
+                    # (or logged why it could not — accepted single-attempt loss).
                     log(f"giving up on {key} after {rec['fails']} failures")
-                    record_give_up(rec, owner, repo, num, "issue", reason)
-                    # Persist the give-up BEFORE attempting delivery. api() raises a bare
-                    # TimeoutError/URLError on a transport failure, neither of which is an
-                    # HTTPError, so it escapes the flush and kills the tick — leaving the
-                    # `fails` increment unsaved and costing a full re-review next tick. The
-                    # notice is already on the record, so the top-of-tick flush delivers it.
-                    save_state(state)
-                    flush_give_up_notices(answered, token)
             save_state(state)
 
     log(f"done — {reviews_done} review(s) this tick")

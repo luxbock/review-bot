@@ -46,9 +46,10 @@ HANDLE_ALIASES = [h for h in re.split(r"[\s,]+", os.environ.get("REVIEW_BOT_HAND
 REVIEW_MARKER = "Automated review by **review-bot**"
 TRIAGE_MARKER = "Automated triage by **review-bot**"
 PARK_MARKER = "review-bot — parked"
-# A give-up notice (poll.py's FAIL_MARKER). Classified in its own right rather than left to
-# fall through to "other": this is the comment a caller polling for a verdict most needs to
-# tell apart from a real one, because it means no analysis happened at all.
+# A give-up notice (review.py's FAIL_MARKER — posted in-band by a poller-invoked run that
+# could not produce a result). Classified in its own right rather than left to fall through
+# to "other": this is the comment a caller polling for a verdict most needs to tell apart
+# from a real one, because it means no analysis happened at all.
 FAIL_MARKER = "review-bot — could not complete"
 
 KINDS = ("review", "triage", "parked", "failed", "other")

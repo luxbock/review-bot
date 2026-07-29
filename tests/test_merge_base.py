@@ -138,10 +138,11 @@ class MergeBaseTest(unittest.TestCase):
     def test_usable_recorded_base_preserves_merged_pr_diff(self):
         checkout, merge_base, journal = self._prepare(self.base_sha)
         with checkout:
-            # changed_files_block returns (block, inlined) since issue #21's
-            # instrumentation landed — unpack, or `assertIn` would test tuple
-            # membership rather than the substring it looks like it tests.
-            diff_block, inlined = self.review.changed_files_block(
+            # changed_files_block returns (block, inlined, stats) since issue #21's
+            # instrumentation and the empty-verdict calibration landed — unpack, or
+            # `assertIn` would test tuple membership rather than the substring it
+            # looks like it tests.
+            diff_block, inlined, _stats = self.review.changed_files_block(
                 checkout.wt, merge_base, self.auth
             )
 

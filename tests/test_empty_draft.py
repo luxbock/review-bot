@@ -20,10 +20,22 @@ import sys
 import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EMPTY_FINDER_DISCLOSURE = (
-    "⚠️ The finder stage returned no findings, so nothing was verified — "
-    "this reports an empty finder, not a verified-clean diff."
+# The PR path always measures the diff, so a real review renders one of the two
+# calibrated tiers; the flat line survives only for renders with no measurement.
+SMALL_DISCLOSURE = (
+    "0 findings on a small change (1 file, +2/-0) — an empty result is typical "
+    "and consistent with a clean PR. Verification skipped: nothing to verify."
 )
+EMPTY_DISCLOSURE_TELLS = (
+    "0 findings on a small change",
+    "0 findings on a substantial change",
+    "The finder stage returned no findings",
+)
+
+
+def assert_no_empty_disclosure(markdown):
+    for tell in EMPTY_DISCLOSURE_TELLS:
+        assert tell not in markdown, markdown
 
 
 def load_module(name, path):
@@ -327,13 +339,13 @@ def test_empty_pr_skips_verify_and_discloses():
     assert calls == 1, calls
     expected = (
         "No blocking issues found at or above the **medium** confidence bar.\n\n"
-        + EMPTY_FINDER_DISCLOSURE
+        + SMALL_DISCLOSURE
     )
     assert expected in markdown, markdown
     assert "findings `claude 0→0`" in markdown
     feedback = load_module("feedback_empty_draft_test", os.path.join(REPO_ROOT, "feedback.py"))
     assert feedback.classify(markdown) == "review"
-    print("ok  1. empty PR draft: one call, explicit disclosure, footer, classification")
+    print("ok  1. empty PR draft: one call, calibrated disclosure, footer, classification")
 
 
 def test_two_findings_verified_to_zero():
@@ -341,7 +353,7 @@ def test_two_findings_verified_to_zero():
         markdown, calls, _err = run_pr_case(tmp, [REALISTIC_DRAFT, EMPTY_REVIEW])
     assert calls == 2, calls
     assert "All 2 draft finding(s) were checked and dropped by the verification stage." in markdown
-    assert EMPTY_FINDER_DISCLOSURE not in markdown
+    assert_no_empty_disclosure(markdown)
     assert "findings `claude 2→0`" in markdown
     print("ok  2. realistic two-finding draft: two calls, verified-drop disclosure")
 
@@ -350,7 +362,7 @@ def test_degenerate_two_findings_verified_to_one():
     with scratch_dir() as tmp:
         markdown, calls, _err = run_pr_case(tmp, [DEGENERATE_DRAFT, VERIFIED_ONE])
     assert calls == 2, calls
-    assert EMPTY_FINDER_DISCLOSURE not in markdown
+    assert_no_empty_disclosure(markdown)
     assert "draft finding(s) were checked and dropped" not in markdown
     assert "findings `claude 2→1`" in markdown
     assert "### Findings (1)" in markdown
@@ -420,7 +432,7 @@ def test_green_nonempty_verdict_keeps_body_and_footer():
     assert markdown.startswith("## 🤖 review-bot — ✅ no blocking issues")
     assert "### Findings (1)" in markdown
     assert "The new fallback has no focused test" in markdown
-    assert EMPTY_FINDER_DISCLOSURE not in markdown
+    assert_no_empty_disclosure(markdown)
     assert "draft finding(s) were checked and dropped" not in markdown
     assert "findings `claude 1→1`" in markdown
     # A non-empty finder journals nothing: the diagnostic marks a rare event, so it must
@@ -474,7 +486,7 @@ def test_scraped_fragment_triggers_repair_instead_of_a_clean_review():
         )
     assert calls == 3, calls  # generate (refused) -> repair -> verify
     # The finder was never empty, so there is no green review to mistake for one.
-    assert EMPTY_FINDER_DISCLOSURE not in markdown, markdown
+    assert_no_empty_disclosure(markdown)
     assert "findings `claude 2→1`" in markdown, markdown
     assert "The new fallback has no focused test" in markdown, markdown
     assert "carrying none of verdict/findings" in err, err
@@ -628,6 +640,36 @@ def test_genuine_check_is_mode_aware():
     print("ok 17. the genuine/defaulted check follows the schema of the mode that ran")
 
 
+def test_disclosure_tiers_follow_diff_size():
+    """The empty-verdict calibration: the tier boundary is inclusive on both knobs, the
+    raw numbers always render, and a render with no measurement keeps the flat warning.
+    The tiers only reword the disclosure — a tier change can never add findings."""
+    review = fresh_review()
+    prov = {"stages": [{"harness": "claude", "draft_count": 0, "surviving_count": 0}]}
+
+    def render(stats):
+        return review.render_markdown(
+            {"verdict": "approve", "summary": "", "findings": []},
+            ["claude"], "standard", "medium", "f" * 40,
+            provenance={"stages": list(prov["stages"])}, diff_stats=stats,
+        )
+
+    at_boundary = render({"files": 5, "insertions": 150, "deletions": 50})
+    assert "0 findings on a small change (5 files, +150/-50)" in at_boundary, at_boundary
+    assert "⚠️" not in at_boundary, at_boundary
+
+    over_files = render({"files": 6, "insertions": 10, "deletions": 0})
+    assert "⚠️ 0 findings on a substantial change (6 files, +10/-0)" in over_files, over_files
+    assert "not fully reviewed" in over_files, over_files
+
+    over_lines = render({"files": 1, "insertions": 200, "deletions": 1})
+    assert "substantial change (1 file, +200/-1)" in over_lines, over_lines
+
+    unmeasured = render(None)
+    assert "The finder stage returned no findings" in unmeasured, unmeasured
+    print("ok 18. disclosure tier tracks the measured diff size; boundary is inclusive")
+
+
 def test_raw_excerpt_clips_head_and_tail():
     review = fresh_review()
     long_text = "A" * 3000 + "MIDDLE" + "Z" * 3000
@@ -657,6 +699,7 @@ def main():
         test_triage_fragment_at_the_verify_stage_is_refused_too,
         test_disposition_defaulted_at_the_verify_stage_is_journalled,
         test_genuine_check_is_mode_aware,
+        test_disclosure_tiers_follow_diff_size,
     ]
     for test in tests:
         test()
