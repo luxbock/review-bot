@@ -65,6 +65,9 @@ MAX_FAILS = int(os.environ.get("REVIEW_BOT_MAX_FAILS", "3"))
 # review rounds and to recognise our own reviews. Must match render_markdown in review.py.
 REVIEW_MARKER = "Automated review by **review-bot**"
 PARK_MARKER = "review-bot — parked"
+# Deliberately does NOT contain REVIEW_MARKER: a give-up notice is not a review and must
+# not count toward MAX_ROUNDS.
+FAIL_MARKER = "review-bot — could not complete"
 
 
 def log(msg):
@@ -230,9 +233,20 @@ def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr"):
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         log(f"review-bot-review failed (rc={proc.returncode}): {proc.stderr.strip()[-500:]}")
-        return False
+        return False, failure_reason(proc.stderr)
     log(f"{mode} done {owner}/{repo}#{num}: {proc.stdout.strip()}")
-    return True
+    return True, None
+
+
+def failure_reason(stderr):
+    """The reviewer's own error headline. die() appends the offending engine output after
+    the first line; that belongs in the journal, not in a public comment, so take the
+    headline only."""
+    for line in (stderr or "").splitlines():
+        if line.startswith("review-bot-review: error:"):
+            return line.split("error:", 1)[1].strip()[:300] or "(no detail)"
+    tail = [ln for ln in (stderr or "").strip().splitlines() if ln.strip()]
+    return tail[-1].strip()[:300] if tail else "(no error detail)"
 
 
 def post_parked(owner, repo, pr, rounds, token):
@@ -244,6 +258,53 @@ def post_parked(owner, repo, pr, rounds, token):
     )
     api("POST", f"repos/{owner}/{repo}/issues/{pr}/comments", token, data={"body": body})
     log(f"parked {owner}/{repo}#{pr} after {rounds} rounds (pinged @{OWNER_HANDLE})")
+
+
+def post_failed(owner, repo, num, fails, reason, mode, token):
+    """Report a give-up in the thread. Until this existed a run that could not produce a
+    result posted NOTHING, and callers waiting on a reply — agents poll their own PRs for
+    one — blocked indefinitely on a comment that was never coming. Carries no REVIEW_MARKER,
+    so it is not counted as a review round."""
+    what, past = ("review", "reviewed") if mode == "pr" else ("triage", "triaged")
+    body = (
+        f"## 🤖 {FAIL_MARKER}\n\n"
+        f"@{OWNER_HANDLE} I tried to {what} this {fails} time(s) and could not produce a "
+        f"usable result, so **nothing here was {past}**. This is not an approval and not "
+        f"a clean bill of health — no analysis was performed.\n\n"
+        f"Reason: `{reason}`\n\n"
+        f"Automatic attempts have stopped. Ask me directly "
+        f"(`review-bot-review … --{'pr' if mode == 'pr' else 'issue'} {num}`) to retry."
+    )
+    api("POST", f"repos/{owner}/{repo}/issues/{num}/comments", token, data={"body": body})
+    log(f"reported give-up on {owner}/{repo}#{num} after {fails} failure(s)")
+
+
+def record_give_up(rec, owner, repo, num, mode, reason):
+    """Attach everything post_failed needs to the state record. Kept separate from delivery
+    because a give-up is terminal for its trigger — is_done() skips it from the next tick
+    on — so a notice that fails to POST has no other chance to be reconstructed."""
+    rec["notice"] = {
+        "owner": owner, "repo": repo, "num": num, "mode": mode,
+        "fails": rec.get("fails", 0), "reason": reason or "(no error detail)",
+    }
+
+
+def flush_give_up_notices(answered, token, dry=False):
+    """Deliver every recorded give-up notice that has not reached the forge yet. Runs at the
+    give-up itself and again at the start of each tick, so a transient HTTP failure retries
+    instead of leaving a caller waiting on a comment that is never coming."""
+    for key, rec in answered.items():
+        if rec.get("status") != "given-up" or rec.get("reported") or not rec.get("notice"):
+            continue
+        n = rec["notice"]
+        if dry:
+            log(f"[dry-run] would report give-up on {n['owner']}/{n['repo']}#{n['num']}")
+            continue
+        try:
+            post_failed(n["owner"], n["repo"], n["num"], n["fails"], n["reason"], n["mode"], token)
+            rec["reported"] = True
+        except urllib.error.HTTPError as e:
+            log(f"could not post give-up notice for {key} (HTTP {e.code}) — retrying next tick")
 
 
 def main():
@@ -282,6 +343,11 @@ def main():
 
     state = load_state()
     answered = state["answered"]
+    # Retry any notice that did not reach the forge on an earlier tick, before the scan —
+    # its trigger is `given-up`, so nothing below will reach it again.
+    flush_give_up_notices(answered, token, dry)
+    if not dry:
+        save_state(state)
 
     def is_done(key):
         st = answered.get(key, {}).get("status")
@@ -366,7 +432,7 @@ def main():
                 log(f"[dry-run] would review {slug}#{num}: harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r} (trigger {key})")
                 reviews_done += 1
                 continue
-            ok = run_review(owner, repo, num, harness, depth, bar, focus)
+            ok, reason = run_review(owner, repo, num, harness, depth, bar, focus)
             if ok:
                 answered[key] = {"status": "done", "sha": head_sha}
                 reviews_done += 1
@@ -377,6 +443,8 @@ def main():
                 answered[key] = rec
                 if rec["status"] == "given-up":
                     log(f"giving up on {key} after {rec['fails']} failures")
+                    record_give_up(rec, owner, repo, num, "pr", reason)
+                    flush_give_up_notices(answered, token)
             save_state(state)
 
         # ── open ISSUES: @review-bot mentions → triage (mode=issue) ────────────
@@ -423,7 +491,7 @@ def main():
                 log(f"[dry-run] would triage {slug}#{num}: harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r} (trigger {key})")
                 reviews_done += 1
                 continue
-            ok = run_review(owner, repo, num, harness, depth, bar, focus, mode="issue")
+            ok, reason = run_review(owner, repo, num, harness, depth, bar, focus, mode="issue")
             if ok:
                 answered[key] = {"status": "done"}
                 reviews_done += 1
@@ -434,6 +502,8 @@ def main():
                 answered[key] = rec
                 if rec["status"] == "given-up":
                     log(f"giving up on {key} after {rec['fails']} failures")
+                    record_give_up(rec, owner, repo, num, "issue", reason)
+                    flush_give_up_notices(answered, token)
             save_state(state)
 
     log(f"done — {reviews_done} review(s) this tick")

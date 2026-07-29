@@ -62,6 +62,41 @@ after its confidence-bar sentence:
 If verification instead checks a non-empty draft and removes every finding, the
 review says `All N draft finding(s) were checked and dropped by the verification stage.`
 
+### Refusing a scraped fragment
+
+`find_json_object` takes the first balanced `{...}` in the engine's reply, and every
+`normalize*` defaults the fields it does not find — `verdict` → `comment`, `findings` →
+`[]`, `disposition` → `needs-info`. So a JSON fragment quoted inside a prose reply used to
+be normalized into a confident result: a green review, or a `needs-info` triage, that no
+analysis produced.
+
+A scraped object must now carry at least one key its mode's schema defines (`verdict` or
+`findings` for a PR review, `findings` for an audit, `disposition` for a triage).
+Presence-only — it never judges content, so no genuine result can be refused by it,
+**including a legitimately empty one**. A refused object is treated exactly like output
+that never parsed: the JSON-repair retry runs, and if that also fails the run aborts.
+
+This is strictly a downgrade: it can turn a false clean into a real answer or into a
+failure, and it can never turn a clean into a finding. It changes nothing for a
+well-formed reply, which is nearly all traffic.
+
+### When a run gives up
+
+`poll.py` retries a failing trigger up to `REVIEW_BOT_MAX_FAILS` (3) and then stops. It
+now says so in the thread instead of falling silent:
+
+> ## 🤖 review-bot — could not complete
+> @olli I tried to review this 3 time(s) and could not produce a usable result, so
+> **nothing here was reviewed**. This is not an approval and not a clean bill of health …
+
+Silence was not read as approval, but it did block callers: agents open a PR and then poll
+for review-bot's reply, and a run that could not finish posted nothing at all. The notice
+carries no `REVIEW_MARKER`, so it is not counted as a review round, and
+`review-bot-feedback` classifies it as its own kind, `failed` — a caller filtering kinds
+can tell "no analysis happened" apart from a verdict. Only the error headline is relayed;
+the engine output `die()` appends stays in the journal. Delivery is recorded in the poll
+state, so a notice the forge rejects is retried on the next tick rather than lost.
+
 ### The empty-finder diagnostic
 
 The disclosure above says *that* the finder was empty; it cannot say **why**, and

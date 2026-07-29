@@ -1009,10 +1009,26 @@ def log_defaulted_triage_diagnostic(harness, diag, stage, posted):
                                         sort_keys=True, default=str))
 
 
-def _parse_engine_output(raw, harness, key, norm):
+# A scraped object must carry at least one key its mode's schema defines. Every normalize*
+# defaults the fields it does not find — verdict -> "comment", findings -> [], disposition
+# -> "needs-info" — so an object with NONE of them is not a partial result, it is a
+# different object that happened to be the first balanced {...} in the reply. Accepting it
+# manufactures a confident answer out of a fragment. The test is presence-only and never
+# judges content: a real result always carries one of these, so no genuine review, audit or
+# triage can be rejected by it — including a legitimately empty one.
+RESULT_KEYS = {
+    "pr": ("verdict", "findings"),
+    "repo": ("findings",),
+    "issue": ("disposition",),
+}
+
+
+def _parse_engine_output(raw, harness, key, norm, accept=()):
     """Raw engine stdout -> (normalized_obj_or_None, inner_text_for_a_repair_retry,
     parse_facts_or_None). The third element records how the JSON was reached and what it
-    carried, for log_empty_finder_diagnostic."""
+    carried, for log_empty_finder_diagnostic. A scraped object carrying none of `accept`
+    is refused (`rejected: True`) and reported as unparsed, so the caller's repair retry
+    handles it exactly like output that never parsed at all."""
     text, path = raw, "raw"
     if harness == "claude":
         # `claude -p --output-format json` wraps the answer in an envelope; the real
@@ -1028,7 +1044,11 @@ def _parse_engine_output(raw, harness, key, norm):
     obj = find_json_object(text)
     if obj is None:
         return None, text, None
-    return norm(obj), text, _describe_parsed(obj, path)
+    parse = _describe_parsed(obj, path)
+    if accept and isinstance(obj, dict) and not any(k in obj for k in accept):
+        parse["rejected"] = True
+        return None, text, parse
+    return norm(obj), text, parse
 
 
 def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
@@ -1045,8 +1065,9 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     else:
         norm, key = normalize, "verdict"
 
+    accept = RESULT_KEYS.get(mode, RESULT_KEYS["pr"])
     _fill_diag(diag, harness=harness, mode=mode, raw_chars=len(raw), raw_excerpt=_clip(raw))
-    result, text, parse = _parse_engine_output(raw, harness, key, norm)
+    result, text, parse = _parse_engine_output(raw, harness, key, norm, accept)
     if result is not None:
         _fill_diag(diag, repair_retried=False, parse=parse)
         return result
@@ -1056,7 +1077,17 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     # reviews) — which otherwise fails the whole review even though the analysis was
     # sound. Ask the engine to reformat its own prior output as strict JSON before giving
     # up: cheaper and more faithful than discarding the review or re-generating it.
-    log(f"{harness} did not return parseable JSON; attempting one reformat retry")
+    if parse is not None and parse.get("rejected"):
+        # Distinguish the two ways we get here: nothing parsed at all, versus something
+        # parsed and was refused. The second used to be posted as a confident result.
+        log(
+            f"{harness} returned JSON carrying none of {'/'.join(accept)} "
+            f"(keys {','.join(parse.get('keys') or []) or '(none)'}) — refusing to "
+            f"normalize a fragment into a result; attempting one reformat retry"
+        )
+        _fill_diag(diag, rejected_parse=parse)
+    else:
+        log(f"{harness} did not return parseable JSON; attempting one reformat retry")
     _fill_diag(diag, repair_retried=True)
     schema_hint = {"issue": TRIAGE_SCHEMA_HINT, "repo": AUDIT_SCHEMA_HINT}.get(mode, REVIEW_SCHEMA_HINT)
     repaired = run_engine(
@@ -1064,7 +1095,7 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     )
     if repaired is not None:
         _fill_diag(diag, repair_chars=len(repaired), repair_excerpt=_clip(repaired))
-        result, _text, parse = _parse_engine_output(repaired, harness, key, norm)
+        result, _text, parse = _parse_engine_output(repaired, harness, key, norm, accept)
         if result is not None:
             _fill_diag(diag, parse=parse)
             return result
