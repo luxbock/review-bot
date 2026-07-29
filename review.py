@@ -83,6 +83,16 @@ ENGINE_TIMEOUT = int(os.environ.get("REVIEW_BOT_ENGINE_TIMEOUT", "1800"))
 # real multi-engine run (ENGINE_TIMEOUT is 30min per engine).
 WT_STALE_SECS = int(os.environ.get("REVIEW_BOT_WT_STALE_SECS", "21600"))
 DIFF_INLINE_CAP = int(os.environ.get("REVIEW_BOT_DIFF_CAP", "60000"))
+# Empty-verdict calibration: a zero-finding result is read against the size of the diff
+# it was asked about. On a small change an empty finder is the expected answer for a
+# clean PR; issue #21 measured the finder returning 2, 2, 0 findings on byte-identical
+# input, so on a substantial change a single empty sample is weak evidence. The tiers
+# only reword the disclosure — they can never add findings (a remedy may downgrade a
+# green verdict to "unknown", never upgrade it to a finding).
+SMALL_DIFF_MAX_FILES = int(os.environ.get("REVIEW_BOT_SMALL_DIFF_MAX_FILES", "5"))
+SMALL_DIFF_MAX_LINES = int(os.environ.get("REVIEW_BOT_SMALL_DIFF_MAX_LINES", "200"))
+# Pinged in the in-band failure notice, same knob as poll.py's.
+OWNER_HANDLE = os.environ.get("REVIEW_BOT_OWNER_HANDLE", "olli")
 # Forgejo populates refs/pull/N/head asynchronously after a branch push, so a review
 # fired seconds later can fetch the pre-push commit. prepare_checkout re-fetches the
 # pull ref with bounded exponential backoff until it matches meta["head"]["sha"];
@@ -142,6 +152,7 @@ DISPOSITION_LABEL = {
 
 def die(msg, code=1) -> NoReturn:
     print(f"review-bot-review: error: {msg}", file=sys.stderr)
+    _post_failure_notice(str(msg))
     sys.exit(code)
 
 
@@ -174,6 +185,69 @@ def api(method, path, token, data=None):
         die(f"{method} {path} -> HTTP {e.code}{hint}\n{detail}")
     except urllib.error.URLError as e:
         die(f"{method} {path} -> {e.reason} (is {FORGE_URL} reachable from here?)")
+
+
+# ── in-band failure notice ─────────────────────────────────────────────────────
+# Marker for the give-up comment. Must stay in sync with feedback.py's FAIL_MARKER
+# (classified "failed") and deliberately shares nothing with render_markdown's
+# "Automated review by **review-bot**" footer, so poll.py never counts a notice as a
+# review round.
+FAIL_MARKER = "review-bot — could not complete"
+
+# Armed by main() when the poller passes --post-failure-notice: everything one comment
+# needs to say "this run produced nothing". A module global rather than a parameter
+# because die() is called from every layer of the pipeline and the point is to fire on
+# ANY abort, not just the ones that remembered to thread a context through. The serve
+# path rebinds die(), so this module's die-hook never fires there; serve arms this
+# explicitly and delivers it from its own failure handlers instead (see serve.py main()).
+FAILURE_NOTICE = None
+
+
+def arm_failure_notice(owner, repo, num, mode, attempts, token):
+    global FAILURE_NOTICE
+    FAILURE_NOTICE = {"owner": owner, "repo": repo, "num": num, "mode": mode,
+                      "attempts": attempts, "token": token}
+
+
+def _disarm_failure_notice():
+    global FAILURE_NOTICE
+    FAILURE_NOTICE = None
+
+
+def _post_failure_notice(reason):
+    """Post the give-up comment, once, best-effort. Until this existed a run that could
+    not produce a result posted NOTHING, and callers waiting on a reply — agents poll
+    their own PRs for one — blocked on a comment that was never coming. Single attempt,
+    no retry (olli's explicit ruling): if this POST fails the notice is lost and the log
+    line is the only trace; the alternative was a persistent delivery state machine in
+    poll.py. Disarms BEFORE posting so the api() -> die() error path cannot recurse."""
+    global FAILURE_NOTICE
+    fn, FAILURE_NOTICE = FAILURE_NOTICE, None
+    if not fn:
+        return
+    what, past = ("review", "reviewed") if fn["mode"] == "pr" else ("triage", "triaged")
+    # die() appends the offending engine output after the first line; that belongs in
+    # the journal, not in a public comment, so the notice carries the headline only.
+    lines = [ln for ln in (reason or "").strip().splitlines() if ln.strip()]
+    headline = lines[0].strip()[:300] if lines else "(no error detail)"
+    body = (
+        f"## 🤖 {FAIL_MARKER}\n\n"
+        f"@{OWNER_HANDLE} I tried to {what} this {fn['attempts']} time(s) and could not "
+        f"produce a usable result, so **nothing here was {past}**. This is not an "
+        f"approval and not a clean bill of health — no analysis was performed.\n\n"
+        f"Reason: `{headline}`\n\n"
+        f"Automatic attempts have stopped. Ask me directly "
+        f"(`review-bot-review … --{'pr' if fn['mode'] == 'pr' else 'issue'} {fn['num']}`) to retry."
+    )
+    try:
+        api("POST", f"repos/{fn['owner']}/{fn['repo']}/issues/{fn['num']}/comments",
+            fn["token"], data={"body": body})
+        log(f"posted failure notice on {fn['owner']}/{fn['repo']}#{fn['num']}")
+    except (Exception, SystemExit):
+        # api()'s error paths call die(), which raises SystemExit — swallow it too, so
+        # the caller exits with the ORIGINAL failure, not the notice's delivery problem.
+        log(f"could not post the failure notice on {fn['owner']}/{fn['repo']}#{fn['num']} "
+            "— accepted loss (single attempt, no retry)")
 
 
 def api_paged(path, token):
@@ -543,16 +617,29 @@ def prepare_checkout(
 
 
 def changed_files_block(cdir, merge_base, auth):
-    """Return (block, inlined) — the review prompt's diff input plus the flag saying
-    whether the FULL diff was inlined or only the file list was.
+    """Return (block, inlined, stats) — the review prompt's diff input, the flag saying
+    whether the FULL diff was inlined or only the file list was, and the diff's size
+    ({"files": N, "insertions": A, "deletions": D}) for the empty-verdict calibration.
 
-    The flag is returned rather than re-derived by the caller on purpose (issue #21):
-    the size comparison exists in exactly one place, so the journal line and the review
-    footer can never disagree with the input the engine actually saw.
+    The flag and the stats are returned rather than re-derived by the caller on purpose
+    (issue #21): each measurement exists in exactly one place, so the journal line, the
+    review footer and the disclosure can never disagree with the input the engine
+    actually saw.
     """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
+    numstat = git(["diff", "--numstat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
+    files = insertions = deletions = 0
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        files += 1
+        # Binary files report "-" for both counts: a changed file with no countable lines.
+        insertions += int(parts[0]) if parts[0].isdigit() else 0
+        deletions += int(parts[1]) if parts[1].isdigit() else 0
+    stats = {"files": files, "insertions": insertions, "deletions": deletions}
     inlined = len(diff) <= DIFF_INLINE_CAP
     # The measurement is logged BEFORE the empty-diff refusal below, not after: a 0-char
     # diff is exactly the case tools/finder_ab.py needs the number for, since `0 <= cap`
@@ -567,12 +654,13 @@ def changed_files_block(cdir, merge_base, auth):
             "refusing to render a vacuous pass"
         )
     if inlined:
-        return f"{stat}\n```diff\n{diff}\n```", True
+        return f"{stat}\n```diff\n{diff}\n```", True, stats
     return (
         f"{stat}\n\n(diff is large — only the file list is inlined. The repo is checked "
         f"out at the PR head; run `git diff {merge_base[:12]}..HEAD -- <file>` to inspect "
         f"specific hunks.)",
         False,
+        stats,
     )
 
 
@@ -1009,10 +1097,26 @@ def log_defaulted_triage_diagnostic(harness, diag, stage, posted):
                                         sort_keys=True, default=str))
 
 
-def _parse_engine_output(raw, harness, key, norm):
+# A scraped object must carry at least one key its mode's schema defines. Every normalize*
+# defaults the fields it does not find — verdict -> "comment", findings -> [], disposition
+# -> "needs-info" — so an object with NONE of them is not a partial result, it is a
+# different object that happened to be the first balanced {...} in the reply. Accepting it
+# manufactures a confident answer out of a fragment. The test is presence-only and never
+# judges content: a real result always carries one of these, so no genuine review, audit or
+# triage can be rejected by it — including a legitimately empty one.
+RESULT_KEYS = {
+    "pr": ("verdict", "findings"),
+    "repo": ("findings",),
+    "issue": ("disposition",),
+}
+
+
+def _parse_engine_output(raw, harness, key, norm, accept=()):
     """Raw engine stdout -> (normalized_obj_or_None, inner_text_for_a_repair_retry,
     parse_facts_or_None). The third element records how the JSON was reached and what it
-    carried, for log_empty_finder_diagnostic."""
+    carried, for log_empty_finder_diagnostic. A scraped object carrying none of `accept`
+    is refused (`rejected: True`) and reported as unparsed, so the caller's repair retry
+    handles it exactly like output that never parsed at all."""
     text, path = raw, "raw"
     if harness == "claude":
         # `claude -p --output-format json` wraps the answer in an envelope; the real
@@ -1028,7 +1132,11 @@ def _parse_engine_output(raw, harness, key, norm):
     obj = find_json_object(text)
     if obj is None:
         return None, text, None
-    return norm(obj), text, _describe_parsed(obj, path)
+    parse = _describe_parsed(obj, path)
+    if accept and isinstance(obj, dict) and not any(k in obj for k in accept):
+        parse["rejected"] = True
+        return None, text, parse
+    return norm(obj), text, parse
 
 
 def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
@@ -1045,8 +1153,9 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     else:
         norm, key = normalize, "verdict"
 
+    accept = RESULT_KEYS.get(mode, RESULT_KEYS["pr"])
     _fill_diag(diag, harness=harness, mode=mode, raw_chars=len(raw), raw_excerpt=_clip(raw))
-    result, text, parse = _parse_engine_output(raw, harness, key, norm)
+    result, text, parse = _parse_engine_output(raw, harness, key, norm, accept)
     if result is not None:
         _fill_diag(diag, repair_retried=False, parse=parse)
         return result
@@ -1056,7 +1165,17 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     # reviews) — which otherwise fails the whole review even though the analysis was
     # sound. Ask the engine to reformat its own prior output as strict JSON before giving
     # up: cheaper and more faithful than discarding the review or re-generating it.
-    log(f"{harness} did not return parseable JSON; attempting one reformat retry")
+    if parse is not None and parse.get("rejected"):
+        # Distinguish the two ways we get here: nothing parsed at all, versus something
+        # parsed and was refused. The second used to be posted as a confident result.
+        log(
+            f"{harness} returned JSON carrying none of {'/'.join(accept)} "
+            f"(keys {','.join(parse.get('keys') or []) or '(none)'}) — refusing to "
+            f"normalize a fragment into a result; attempting one reformat retry"
+        )
+        _fill_diag(diag, rejected_parse=parse)
+    else:
+        log(f"{harness} did not return parseable JSON; attempting one reformat retry")
     _fill_diag(diag, repair_retried=True)
     schema_hint = {"issue": TRIAGE_SCHEMA_HINT, "repo": AUDIT_SCHEMA_HINT}.get(mode, REVIEW_SCHEMA_HINT)
     repaired = run_engine(
@@ -1064,7 +1183,7 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
     )
     if repaired is not None:
         _fill_diag(diag, repair_chars=len(repaired), repair_excerpt=_clip(repaired))
-        result, _text, parse = _parse_engine_output(repaired, harness, key, norm)
+        result, _text, parse = _parse_engine_output(repaired, harness, key, norm, accept)
         if result is not None:
             _fill_diag(diag, parse=parse)
             return result
@@ -1095,17 +1214,38 @@ def provenance_counts(provenance):
     return counts
 
 
-def append_clean_review_provenance(out, provenance):
+def append_clean_review_provenance(out, provenance, diff_stats=None):
     stages = provenance.get("stages", []) if provenance else []
     if not stages:
         return
     total_draft = sum(stage["draft_count"] for stage in stages)
     if total_draft == 0:
-        out += [
-            "⚠️ The finder stage returned no findings, so nothing was verified — "
-            "this reports an empty finder, not a verified-clean diff.",
-            "",
-        ]
+        if diff_stats:
+            n = diff_stats["files"]
+            plus, minus = diff_stats["insertions"], diff_stats["deletions"]
+            size = f"{n} file{'s' if n != 1 else ''}, +{plus}/-{minus}"
+            if n <= SMALL_DIFF_MAX_FILES and plus + minus <= SMALL_DIFF_MAX_LINES:
+                out += [
+                    f"0 findings on a small change ({size}) — an empty result is "
+                    "typical and consistent with a clean PR. Verification skipped: "
+                    "nothing to verify.",
+                    "",
+                ]
+            else:
+                out += [
+                    f"⚠️ 0 findings on a substantial change ({size}) — empty results "
+                    "are weaker evidence at this size. Treat as not fully reviewed; a "
+                    "second pass can be requested with `@review-bot` or "
+                    "`review-bot-review`.",
+                    "",
+                ]
+        else:
+            # No diff measurement available (a direct render outside the PR path).
+            out += [
+                "⚠️ The finder stage returned no findings, so nothing was verified — "
+                "this reports an empty finder, not a verified-clean diff.",
+                "",
+            ]
     elif sum(stage["surviving_count"] for stage in stages) == 0:
         out += [
             f"All {total_draft} draft finding(s) were checked and dropped by the "
@@ -1114,7 +1254,8 @@ def append_clean_review_provenance(out, provenance):
         ]
 
 
-def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, diff_inlined=None):
+def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, diff_inlined=None,
+                    diff_stats=None):
     verdict = review["verdict"]
     findings = review["findings"]
     findings.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
@@ -1123,7 +1264,7 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, 
         out += [review["summary"], ""]
     if not findings:
         out += [f"No blocking issues found at or above the **{bar}** confidence bar.", ""]
-        append_clean_review_provenance(out, provenance)
+        append_clean_review_provenance(out, provenance, diff_stats)
     else:
         out += [f"### Findings ({len(findings)})", ""]
         for f in findings:
@@ -1308,6 +1449,9 @@ def post_or_print(args, token, markdown, kind):
         return markdown, None
     num = args.pr if args.mode == "pr" else args.issue
     created = api("POST", f"repos/{args.owner}/{args.repo}/issues/{num}/comments", token, data={"body": markdown})
+    # The verdict is on the forge — a die() after this point (worktree cleanup, cache
+    # maintenance) must not post a "nothing here was reviewed" notice under it.
+    _disarm_failure_notice()
     url = created.get("html_url") or None
     log(f"posted {kind} comment: {url or '(no html_url returned)'}")
     print(url or "(posted; no html_url returned)")
@@ -1365,7 +1509,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd
-        diff_block, diff_inlined = changed_files_block(cdir, merge_base, auth)
+        diff_block, diff_inlined, diff_stats = changed_files_block(cdir, merge_base, auth)
         conv = convention_files(cdir)
         conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
 
@@ -1404,7 +1548,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
         )
         markdown = render_markdown(
             final, harnesses, args.depth, bar, merge_base, provenance=provenance,
-            diff_inlined=diff_inlined,
+            diff_inlined=diff_inlined, diff_stats=diff_stats,
         )
         return post_or_print(args, token, markdown, "review")
 
@@ -1543,6 +1687,13 @@ def main():
     ap.add_argument("--repo-dir", default="", help="use an existing clone instead of the cache")
     ap.add_argument("--dry-run", action="store_true", help="print prompt(s) + command, post nothing")
     ap.add_argument("--print-only", action="store_true", help="run engines but print markdown, don't POST")
+    ap.add_argument(
+        "--post-failure-notice", type=int, default=0, metavar="ATTEMPTS",
+        help="if this run aborts, post one in-band give-up comment on the target "
+             "(ATTEMPTS = total automatic attempts including this one, shown in the "
+             "notice). Passed by review-bot-poll on a trigger's final attempt; direct "
+             "CLI use, --print-only and --dry-run stay silent.",
+    )
     args = ap.parse_args()
 
     # Resolve mode: --scope repo is an alias for --mode repo; explicit --mode wins; else
@@ -1570,6 +1721,15 @@ def main():
     focus = args.focus.strip() or "(none provided)"
 
     token = load_token()
+    # Arm only for a poller-invoked run that will actually POST: a --print-only or
+    # --dry-run consult is private, and mode=repo has no thread to notify (the poller
+    # never triggers audits). Everything before this point dies silently — those are
+    # argument errors, and there may not even be a valid target to post to.
+    if args.post_failure_notice > 0 and mode in ("pr", "issue") \
+            and not (args.print_only or args.dry_run):
+        arm_failure_notice(args.owner, args.repo,
+                           args.pr if mode == "pr" else args.issue,
+                           mode, args.post_failure_notice, token)
     auth = GitAuth(token)
     try:
         if mode == "issue":

@@ -19,6 +19,9 @@ Request fields (whitelist — any unknown field is a hard error):
   focus           free text, capped at 2000 chars
   print_only      bool — don't POST the comment, return the markdown only
   dry_run         bool — print prompts to the journal, run no engines
+  post_failure_notice  int >= 0 — if the run aborts, post one in-band give-up
+                  comment disclosing this attempt count (0/absent = no notice;
+                  not valid for mode=repo — no thread to notify)
 
 Deliberately NOT accepted: repo_dir (would let a caller point the service at an
 arbitrary path readable by the service user) and any engine-command override —
@@ -76,6 +79,7 @@ ALLOWED_FIELDS = {
     "focus",
     "print_only",
     "dry_run",
+    "post_failure_notice",
 }
 
 
@@ -214,6 +218,15 @@ def parse_request(line, review):
         raise RequestError("'focus' must be a string")
     focus = focus[:FOCUS_CAP]
 
+    # 0 (or absent) = no notice. Positive = post one in-band give-up comment if the run
+    # aborts; the value is the attempt count the notice discloses.
+    post_failure_notice = req.get("post_failure_notice", 0)
+    if isinstance(post_failure_notice, bool) or not isinstance(post_failure_notice, int) \
+            or post_failure_notice < 0:
+        raise RequestError("'post_failure_notice' must be a non-negative integer")
+    if post_failure_notice and mode == "repo":
+        raise RequestError("'post_failure_notice' is not valid for mode=repo (no thread to notify)")
+
     args = argparse.Namespace(
         mode=mode,
         owner=owner,
@@ -227,6 +240,7 @@ def parse_request(line, review):
         repo_dir="",  # deliberately not caller-settable
         dry_run=_req_bool(req, "dry_run"),
         print_only=_req_bool(req, "print_only"),
+        post_failure_notice=post_failure_notice,
     )
     bar = confidence_bar or review.BAR_BY_DEPTH[depth]
     focus = focus.strip() or "(none provided)"
@@ -292,9 +306,20 @@ def main():
     lock_fh = _acquire_pipeline_lock(proto)
     ok, markdown, url, error = False, None, None, None
     auth = None
+    notice_armed = False
     try:
         token = review.load_token()
         auth = review.GitAuth(token)
+        # Arm the in-band give-up notice for the poller's final attempt. serve rebinds
+        # die(), so review.py's own die-hook never runs here — the notice is delivered
+        # from the failure handlers below instead. mode=repo is already rejected by
+        # parse_request, so `num` is a real thread. A delivered verdict disarms it
+        # (post_or_print). Every notice call below is gated on `notice_armed`, so a
+        # test double standing in for review.py never needs the hooks.
+        if args.post_failure_notice and not (args.print_only or args.dry_run):
+            review.arm_failure_notice(args.owner, args.repo, num, args.mode,
+                                      args.post_failure_notice, token)
+            notice_armed = True
         # The pipeline's own prints (print_only markdown / posted URL) belong to the
         # direct CLI; here stdout is the protocol channel, so shunt them to the journal.
         with contextlib.redirect_stdout(sys.stderr):
@@ -310,10 +335,18 @@ def main():
     except ReviewFailure as e:
         error = str(e)
         log(f"review failed: {error}")
+        # Single attempt, best-effort, swallows its own delivery failure (its api()
+        # call raises ReviewFailure here, an Exception, under the rebound die()).
+        if notice_armed:
+            review._post_failure_notice(error)
     except Exception as e:  # never drop the connection without a result line
         error = f"internal error: {e.__class__.__name__}: {e}"
         log(error)
+        if notice_armed:
+            review._post_failure_notice(error)
     finally:
+        if notice_armed:
+            review._disarm_failure_notice()
         if auth is not None:
             auth.cleanup()
         try:

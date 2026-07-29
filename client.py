@@ -107,6 +107,10 @@ def build_request(args):
     # Omit 'number' entirely for repo mode (serve.py makes it optional only for repo).
     if number is not None:
         request["number"] = number
+    # Omitted when unset, so the common request stays byte-identical to before the
+    # field existed.
+    if args.post_failure_notice:
+        request["post_failure_notice"] = args.post_failure_notice
     return request
 
 
@@ -213,6 +217,12 @@ def main():
     ap.add_argument("--repo-dir", default="", help="unsupported here — see review-bot-review-local")
     ap.add_argument("--dry-run", action="store_true", help="service prints prompt(s) to its journal, posts nothing")
     ap.add_argument("--print-only", action="store_true", help="run engines but print markdown, don't POST")
+    ap.add_argument(
+        "--post-failure-notice", type=int, default=0, metavar="ATTEMPTS",
+        help="forwarded to the service: if the run aborts, post one in-band give-up "
+             "comment on the target (ATTEMPTS = total automatic attempts including "
+             "this one). Passed by review-bot-poll on a trigger's final attempt.",
+    )
     args = ap.parse_args()
 
     request = build_request(args)

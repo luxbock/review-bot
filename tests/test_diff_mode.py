@@ -256,14 +256,14 @@ def test_cap_boundary_is_exact():
         assert diff_len(wt, base) == cap
 
         with contextlib.redirect_stderr(io.StringIO()):
-            block, inlined = review.changed_files_block(wt, base, _Auth())
+            block, inlined, _stats = review.changed_files_block(wt, base, _Auth())
         assert inlined is True, "a diff of exactly DIFF_INLINE_CAP chars must inline"
         assert "```diff" in block and "diff is large" not in block
 
         set_payload(wt, n + 1)
         assert diff_len(wt, base) == cap + 1
         with contextlib.redirect_stderr(io.StringIO()):
-            block, inlined = review.changed_files_block(wt, base, _Auth())
+            block, inlined, _stats = review.changed_files_block(wt, base, _Auth())
         assert inlined is False, "one char over the cap must fall back to the file list"
         assert "```diff" not in block and "diff is large" in block
     print("ok  1. cap boundary: exactly DIFF_INLINE_CAP inlines, +1 char elides")

@@ -20,10 +20,22 @@ import sys
 import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EMPTY_FINDER_DISCLOSURE = (
-    "⚠️ The finder stage returned no findings, so nothing was verified — "
-    "this reports an empty finder, not a verified-clean diff."
+# The PR path always measures the diff, so a real review renders one of the two
+# calibrated tiers; the flat line survives only for renders with no measurement.
+SMALL_DISCLOSURE = (
+    "0 findings on a small change (1 file, +2/-0) — an empty result is typical "
+    "and consistent with a clean PR. Verification skipped: nothing to verify."
 )
+EMPTY_DISCLOSURE_TELLS = (
+    "0 findings on a small change",
+    "0 findings on a substantial change",
+    "The finder stage returned no findings",
+)
+
+
+def assert_no_empty_disclosure(markdown):
+    for tell in EMPTY_DISCLOSURE_TELLS:
+        assert tell not in markdown, markdown
 
 
 def load_module(name, path):
@@ -327,13 +339,13 @@ def test_empty_pr_skips_verify_and_discloses():
     assert calls == 1, calls
     expected = (
         "No blocking issues found at or above the **medium** confidence bar.\n\n"
-        + EMPTY_FINDER_DISCLOSURE
+        + SMALL_DISCLOSURE
     )
     assert expected in markdown, markdown
     assert "findings `claude 0→0`" in markdown
     feedback = load_module("feedback_empty_draft_test", os.path.join(REPO_ROOT, "feedback.py"))
     assert feedback.classify(markdown) == "review"
-    print("ok  1. empty PR draft: one call, explicit disclosure, footer, classification")
+    print("ok  1. empty PR draft: one call, calibrated disclosure, footer, classification")
 
 
 def test_two_findings_verified_to_zero():
@@ -341,7 +353,7 @@ def test_two_findings_verified_to_zero():
         markdown, calls, _err = run_pr_case(tmp, [REALISTIC_DRAFT, EMPTY_REVIEW])
     assert calls == 2, calls
     assert "All 2 draft finding(s) were checked and dropped by the verification stage." in markdown
-    assert EMPTY_FINDER_DISCLOSURE not in markdown
+    assert_no_empty_disclosure(markdown)
     assert "findings `claude 2→0`" in markdown
     print("ok  2. realistic two-finding draft: two calls, verified-drop disclosure")
 
@@ -350,7 +362,7 @@ def test_degenerate_two_findings_verified_to_one():
     with scratch_dir() as tmp:
         markdown, calls, _err = run_pr_case(tmp, [DEGENERATE_DRAFT, VERIFIED_ONE])
     assert calls == 2, calls
-    assert EMPTY_FINDER_DISCLOSURE not in markdown
+    assert_no_empty_disclosure(markdown)
     assert "draft finding(s) were checked and dropped" not in markdown
     assert "findings `claude 2→1`" in markdown
     assert "### Findings (1)" in markdown
@@ -420,7 +432,7 @@ def test_green_nonempty_verdict_keeps_body_and_footer():
     assert markdown.startswith("## 🤖 review-bot — ✅ no blocking issues")
     assert "### Findings (1)" in markdown
     assert "The new fallback has no focused test" in markdown
-    assert EMPTY_FINDER_DISCLOSURE not in markdown
+    assert_no_empty_disclosure(markdown)
     assert "draft finding(s) were checked and dropped" not in markdown
     assert "findings `claude 1→1`" in markdown
     # A non-empty finder journals nothing: the diagnostic marks a rare event, so it must
@@ -465,24 +477,34 @@ def test_verdict_only_approve_is_genuine_not_a_pathology():
     print("ok  9. a verdict-only approve counts as genuine, not as a parse pathology")
 
 
-def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
+def test_scraped_fragment_triggers_repair_instead_of_a_clean_review():
+    """The behaviour change. A fragment used to be normalized into a confident green
+    review; it is now refused, and the repair retry recovers the engine's real answer."""
     with scratch_dir() as tmp:
-        markdown, calls, err = run_pr_case(tmp, [DEGENERATE_PROSE])
-    assert calls == 1, calls  # the fragment parsed, so no repair retry fired
-    # Indistinguishable from test 6 in the posted comment — same disclosure, same footer.
-    assert EMPTY_FINDER_DISCLOSURE in markdown, markdown
-    assert "findings `claude 0→0`" in markdown
-    diag = empty_finder_diag(err)
-    assert diag is not None, err
-    assert diag["repair_retried"] is False, diag
-    parse = diag["parse"]
-    # …and fully distinguishable in the journal: neither review key was ever present.
-    assert parse["verdict_present"] is False and parse["verdict_raw"] is None, parse
-    assert parse["findings_kind"] == "missing" and parse["findings_len"] is None, parse
-    assert parse["keys"] == ["file", "line_start", "severity"], parse
-    assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
-    assert "DEFAULTED — not a real result object" in err, err
-    print("ok 10. degenerate parse renders identically but is recorded as defaulted")
+        markdown, calls, err = run_pr_case(
+            tmp, [DEGENERATE_PROSE, REALISTIC_DRAFT, VERIFIED_ONE]
+        )
+    assert calls == 3, calls  # generate (refused) -> repair -> verify
+    # The finder was never empty, so there is no green review to mistake for one.
+    assert_no_empty_disclosure(markdown)
+    assert "findings `claude 2→1`" in markdown, markdown
+    assert "The new fallback has no focused test" in markdown, markdown
+    assert "carrying none of verdict/findings" in err, err
+    assert "refusing to normalize a fragment into a result" in err, err
+    print("ok 10. a scraped fragment is refused and the repair retry recovers the answer")
+
+
+def test_scraped_fragment_twice_aborts_rather_than_posting():
+    """When the repair also fails there is no answer to post. Aborting is the honest
+    outcome; poll.py turns the give-up into a visible notice, which silence never was."""
+    with scratch_dir() as tmp:
+        try:
+            markdown, _calls, _err = run_pr_case(tmp, [DEGENERATE_PROSE, DEGENERATE_PROSE])
+        except SystemExit as e:
+            assert e.code == 1, e.code
+        else:
+            raise AssertionError(f"expected the review to abort, got: {markdown[:200]}")
+    print("ok 11. two unusable replies abort the review instead of inventing a verdict")
 
 
 GOOD_TRIAGE = {
@@ -516,53 +538,59 @@ def test_good_triage_journals_nothing():
     assert calls == 2, calls
     assert "🐛 genuine bug" in markdown, markdown
     assert defaulted_triage_diag(err) is None, err
-    print("ok 12. a triage the engine actually produced journals nothing")
+    print("ok 13. a triage the engine actually produced journals nothing")
 
 
-def test_defaulted_triage_disposition_is_journalled():
-    """Triage NEVER skips verification, and the verify result replaces the draft — so the
-    call the trigger must watch is the one whose object actually gets rendered."""
+def test_triage_fragment_is_refused_not_posted_as_needs_info():
+    """The triage half of the behaviour change. A fragment carrying no `disposition` used
+    to be posted as a confident `needs-info`; it is now refused and repaired."""
     with scratch_dir() as tmp:
-        markdown, calls, err = run_issue_case(tmp, [GOOD_TRIAGE, DEGENERATE_TRIAGE_PROSE])
+        markdown, calls, err = run_issue_case(
+            tmp, [DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE, GOOD_TRIAGE]
+        )
+    assert calls == 3, calls  # generate (refused) -> repair -> verify
+    assert "\U0001f41b genuine bug" in markdown, markdown
+    assert "needs-info" not in markdown, markdown
+    assert "carrying none of disposition" in err, err
+    # Nothing was defaulted in the end, so the triage diagnostic stays quiet.
+    assert defaulted_triage_diag(err) is None, err
+    print("ok 14. a triage fragment is refused rather than posted as a fabricated verdict")
+
+
+def test_triage_fragment_at_the_verify_stage_is_refused_too():
+    """Triage never skips verification and the verify result REPLACES the draft, so the
+    fragment guard has to hold on that call as well — it is the one that gets rendered."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(
+            tmp, [GOOD_TRIAGE, DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE]
+        )
+    assert calls == 3, calls  # generate -> verify (refused) -> repair
+    assert "\U0001f41b genuine bug" in markdown, markdown
+    assert "needs more info" not in markdown, markdown
+    assert defaulted_triage_diag(err) is None, err
+    print("ok 15. a fragment returned by the verify stage is refused too")
+
+
+def test_disposition_defaulted_at_the_verify_stage_is_journalled():
+    """An unrecognised disposition still carries the key, so the fragment guard passes it
+    and normalize_triage coerces it to `needs-info`. The diagnostic must name the stage
+    that produced the posted object — claiming the drafting call would be a false claim of
+    exactly the kind this whole diagnostic exists to prevent."""
+    with scratch_dir() as tmp:
+        bogus = dict(GOOD_TRIAGE, disposition="probably-fine")
+        markdown, calls, err = run_issue_case(tmp, [GOOD_TRIAGE, bogus])
     assert calls == 2, calls
-    # normalize_triage built this header out of a fragment; nobody produced it.
-    assert "❓ needs more info" in markdown, markdown
+    assert "\u2753 needs more info" in markdown, markdown
     diag = defaulted_triage_diag(err)
     assert diag is not None, err
     assert diag["mode"] == "issue", diag
     assert diag["stage"] == "verify" and diag["posted"] is True, diag
-    assert diag["parse"]["disposition_present"] is False, diag
-    assert diag["parse"]["keys"] == ["file", "line_start"], diag
-    assert "I think this is a real defect" in diag["raw_excerpt"], diag
-    assert "DEFAULTED TRIAGE (claude, verify stage)" in err, err
-    assert "supplied none" in err and "this is the disposition being posted" in err, err
-    print("ok 13. a disposition defaulted at the verify stage is journalled")
-
-
-def test_a_draft_anomaly_that_verification_repaired_is_not_journalled():
-    """The inverse, and the reason the trigger cannot just watch the drafting call: it
-    would announce `needs-info` while the comment says `genuine bug` — a false claim of
-    exactly the kind this diagnostic exists to prevent."""
-    with scratch_dir() as tmp:
-        markdown, calls, err = run_issue_case(tmp, [DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE])
-    assert calls == 2, calls
-    assert "🐛 genuine bug" in markdown, markdown
-    assert defaulted_triage_diag(err) is None, err
-    assert "DEFAULTED TRIAGE" not in err, err
-    print("ok 14. a draft anomaly the verify stage repaired is not reported as defaulted")
-
-
-def test_unrecognised_triage_disposition_counts_as_defaulted():
-    """Present-but-unrecognised is coerced to `needs-info` too, and posts just as confidently."""
-    with scratch_dir() as tmp:
-        bogus = dict(GOOD_TRIAGE, disposition="probably-fine")
-        _markdown, _calls, err = run_issue_case(tmp, [bogus, bogus])
-    diag = defaulted_triage_diag(err)
-    assert diag is not None, err
     assert diag["parse"]["disposition_present"] is True, diag
     assert diag["parse"]["disposition_raw"] == "probably-fine", diag
+    assert "DEFAULTED TRIAGE (claude, verify stage)" in err, err
     assert "supplied 'probably-fine'" in err, err
-    print("ok 15. an unrecognised triage disposition is journalled, not silently coerced")
+    assert "this is the disposition being posted" in err, err
+    print("ok 16. a disposition defaulted at the verify stage is journalled with its stage")
 
 
 def test_genuine_check_is_mode_aware():
@@ -570,7 +598,6 @@ def test_genuine_check_is_mode_aware():
     review = fresh_review()
     empty_list = {"findings_kind": "list", "findings_len": 0,
                   "verdict_present": False, "verdict_raw": None}
-    # Non-empty as sent, yet zero drafts survived: normalize* discarded every entry.
     discarded = {"findings_kind": "list", "findings_len": 2,
                  "verdict_present": False, "verdict_raw": None}
     approve_with_discarded = {"findings_kind": "list", "findings_len": 1,
@@ -610,7 +637,37 @@ def test_genuine_check_is_mode_aware():
         assert review.empty_finder_is_genuine(
             {"findings_kind": junk, "verdict_present": False, "verdict_raw": None}, "repo"
         ) is False, junk
-    print("ok 16. the genuine/defaulted check follows the schema of the mode that ran")
+    print("ok 17. the genuine/defaulted check follows the schema of the mode that ran")
+
+
+def test_disclosure_tiers_follow_diff_size():
+    """The empty-verdict calibration: the tier boundary is inclusive on both knobs, the
+    raw numbers always render, and a render with no measurement keeps the flat warning.
+    The tiers only reword the disclosure — a tier change can never add findings."""
+    review = fresh_review()
+    prov = {"stages": [{"harness": "claude", "draft_count": 0, "surviving_count": 0}]}
+
+    def render(stats):
+        return review.render_markdown(
+            {"verdict": "approve", "summary": "", "findings": []},
+            ["claude"], "standard", "medium", "f" * 40,
+            provenance={"stages": list(prov["stages"])}, diff_stats=stats,
+        )
+
+    at_boundary = render({"files": 5, "insertions": 150, "deletions": 50})
+    assert "0 findings on a small change (5 files, +150/-50)" in at_boundary, at_boundary
+    assert "⚠️" not in at_boundary, at_boundary
+
+    over_files = render({"files": 6, "insertions": 10, "deletions": 0})
+    assert "⚠️ 0 findings on a substantial change (6 files, +10/-0)" in over_files, over_files
+    assert "not fully reviewed" in over_files, over_files
+
+    over_lines = render({"files": 1, "insertions": 200, "deletions": 1})
+    assert "substantial change (1 file, +200/-1)" in over_lines, over_lines
+
+    unmeasured = render(None)
+    assert "The finder stage returned no findings" in unmeasured, unmeasured
+    print("ok 18. disclosure tier tracks the measured diff size; boundary is inclusive")
 
 
 def test_raw_excerpt_clips_head_and_tail():
@@ -620,7 +677,7 @@ def test_raw_excerpt_clips_head_and_tail():
     assert clipped.startswith("A" * 50) and clipped.endswith("Z" * 50), clipped
     assert "MIDDLE" not in clipped and "5906 chars elided" in clipped, clipped
     assert review._clip("short", limit=100) == "short"
-    print("ok 11. raw excerpt keeps both ends and states how much it dropped")
+    print("ok 12. raw excerpt keeps both ends and states how much it dropped")
 
 
 def main():
@@ -634,13 +691,15 @@ def main():
         test_green_nonempty_verdict_keeps_body_and_footer,
         test_genuine_empty_verdict_is_recorded_as_genuine,
         test_verdict_only_approve_is_genuine_not_a_pathology,
-        test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted,
+        test_scraped_fragment_triggers_repair_instead_of_a_clean_review,
+        test_scraped_fragment_twice_aborts_rather_than_posting,
         test_raw_excerpt_clips_head_and_tail,
         test_good_triage_journals_nothing,
-        test_defaulted_triage_disposition_is_journalled,
-        test_a_draft_anomaly_that_verification_repaired_is_not_journalled,
-        test_unrecognised_triage_disposition_counts_as_defaulted,
+        test_triage_fragment_is_refused_not_posted_as_needs_info,
+        test_triage_fragment_at_the_verify_stage_is_refused_too,
+        test_disposition_defaulted_at_the_verify_stage_is_journalled,
         test_genuine_check_is_mode_aware,
+        test_disclosure_tiers_follow_diff_size,
     ]
     for test in tests:
         test()

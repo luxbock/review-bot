@@ -55,12 +55,75 @@ Three modes, sharing all the identity/git/engine/post plumbing:
 At `standard` and `deep` depth, each usable finder draft normally goes through
 verification. A zero-finding PR or repo draft skips that no-op engine call and
 stays green, but the PR review makes the stage provenance explicit immediately
-after its confidence-bar sentence:
+after its confidence-bar sentence, **calibrated to the size of the diff it was
+asked about** (the finder is sampled noise — issue #21 measured 2, 2, 0 findings
+on byte-identical input — so one empty sample means more on a small diff than a
+large one). On a small change:
 
-> ⚠️ The finder stage returned no findings, so nothing was verified — this reports an empty finder, not a verified-clean diff.
+> 0 findings on a small change (1 file, +2/-0) — an empty result is typical and consistent with a clean PR. Verification skipped: nothing to verify.
+
+and past either smallness bound (`REVIEW_BOT_SMALL_DIFF_MAX_FILES`, default 5;
+`REVIEW_BOT_SMALL_DIFF_MAX_LINES`, default 200 added+deleted — both inclusive):
+
+> ⚠️ 0 findings on a substantial change (14 files, +610/-230) — empty results are weaker evidence at this size. Treat as not fully reviewed; a second pass can be requested with `@review-bot` or `review-bot-review`.
+
+The raw numbers always render so a consuming agent can apply its own judgment.
+The tiers only reword the disclosure — a tier change can never add findings, and
+neither tier re-rolls the finder. The size comes from the same
+`changed_files_block` measurement the engine's own input comes from; a render
+with no measurement (outside the PR path) keeps the uncalibrated warning
+`⚠️ The finder stage returned no findings, so nothing was verified — this
+reports an empty finder, not a verified-clean diff.`
 
 If verification instead checks a non-empty draft and removes every finding, the
 review says `All N draft finding(s) were checked and dropped by the verification stage.`
+
+### Refusing a scraped fragment
+
+`find_json_object` takes the first balanced `{...}` in the engine's reply, and every
+`normalize*` defaults the fields it does not find — `verdict` → `comment`, `findings` →
+`[]`, `disposition` → `needs-info`. So a JSON fragment quoted inside a prose reply used to
+be normalized into a confident result: a green review, or a `needs-info` triage, that no
+analysis produced.
+
+A scraped object must now carry at least one key its mode's schema defines (`verdict` or
+`findings` for a PR review, `findings` for an audit, `disposition` for a triage).
+Presence-only — it never judges content, so no genuine result can be refused by it,
+**including a legitimately empty one**. A refused object is treated exactly like output
+that never parsed: the JSON-repair retry runs, and if that also fails the run aborts.
+
+This is strictly a downgrade: it can turn a false clean into a real answer or into a
+failure, and it can never turn a clean into a finding. It changes nothing for a
+well-formed reply, which is nearly all traffic.
+
+### When a run gives up
+
+`poll.py` retries a failing trigger up to `REVIEW_BOT_MAX_FAILS` (3) and then stops. The
+thread now hears about it instead of falling silent: on the **final** automatic attempt
+the poller passes `--post-failure-notice N` to `review-bot-review` (the socket client),
+which forwards it as the `post_failure_notice` request field; the service arms the
+notice and posts the give-up comment in-band from its failure handler when the run
+aborts. (`review-bot-review-local`, the direct in-process CLI, posts it at the moment
+`die()` fires — same flag, same comment.)
+
+> ## 🤖 review-bot — could not complete
+> @olli I tried to review this 3 time(s) and could not produce a usable result, so
+> **nothing here was reviewed**. This is not an approval and not a clean bill of health …
+
+Silence was not read as approval, but it did block callers: agents open a PR and then poll
+for review-bot's reply, and a run that could not finish posted nothing at all. The notice
+carries no `REVIEW_MARKER`, so it is not counted as a review round, and
+`review-bot-feedback` classifies it as its own kind, `failed` — a caller filtering kinds
+can tell "no analysis happened" apart from a verdict. Only the error headline is relayed;
+the engine output `die()` appends stays in the journal.
+
+Delivery is **single-attempt by design**: the reviewer posts once, best-effort, and a
+POST that fails is logged and lost — there is no retry, no delivery state, and nothing
+for a later tick to flush. Earlier (non-final) failures post nothing, so a transient
+error heals on the next tick without spamming the thread. The flag is only ever passed
+by the poller; direct CLI use, `--print-only` and `--dry-run` never post a notice, and
+a run that already posted its verdict disarms the notice so a cleanup failure cannot
+post "nothing was reviewed" under a delivered review.
 
 ### The empty-finder diagnostic
 
@@ -270,6 +333,7 @@ Fields are whitelisted (an unknown field is a hard error):
 | `focus`          | str  | free text, capped at 2000 chars                |
 | `print_only`     | bool | return markdown instead of posting             |
 | `dry_run`        | bool | print prompts to the journal, run no engines   |
+| `post_failure_notice` | int | ≥ 0; if the run aborts, post one in-band give-up comment disclosing this attempt count. Not valid for `repo`; the client omits it when 0 (see *When a run gives up*) |
 
 Deliberately **not** accepted: `repo_dir` (the service must not read arbitrary
 caller paths) and engine-command overrides (`REVIEW_BOT_CLAUDE_CMD` /
@@ -294,7 +358,7 @@ pulls that feedback back **programmatically** (issue #2). It is a pure READ:
 
 ```
 review-bot-feedback --owner O --repo R (--pr N | --issue N) \
-                    [--json|--markdown] [--all] [--kind review,triage,parked]
+                    [--json|--markdown] [--all] [--kind review,triage,parked,failed]
 ```
 
 Unlike `review-bot-review`, it needs **only a forge READ token** — no LLM
@@ -308,7 +372,9 @@ strictly read-only: it never posts, labels, or closes.
 - A comment counts as review-bot's iff its author login is in the handle set
   (default `review-bot`, `review_bot`; override via `REVIEW_BOT_HANDLES`, same
   as the poller). Each matched comment is classified by its footer marker into
-  a `kind`: `review`, `triage`, `parked`, or `other`.
+  a `kind`: `review`, `triage`, `parked`, `failed`, or `other`. `failed` is a
+  give-up notice — see *When a run gives up* above; a caller filtering kinds for a
+  verdict must include it, or a run that produced no analysis looks like no reply.
 - `--json` (default) emits an envelope:
 
   ```json

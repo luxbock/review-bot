@@ -61,8 +61,10 @@ MAX_ROUNDS = int(os.environ.get("REVIEW_BOT_MAX_ROUNDS", "3"))
 MAX_PER_RUN = int(os.environ.get("REVIEW_BOT_MAX_PER_RUN", "3"))
 MAX_FAILS = int(os.environ.get("REVIEW_BOT_MAX_FAILS", "3"))
 
-# Footer substring present in EVERY real review (not in a parked notice) — used to count
-# review rounds and to recognise our own reviews. Must match render_markdown in review.py.
+# Footer substring present in EVERY real review — used to count review rounds and to
+# recognise our own reviews. Must match render_markdown in review.py. A parked notice
+# and review.py's in-band "could not complete" notice both lack it on purpose, so
+# neither counts toward MAX_ROUNDS.
 REVIEW_MARKER = "Automated review by **review-bot**"
 PARK_MARKER = "review-bot — parked"
 
@@ -217,7 +219,7 @@ def mention_arg(body, handles):
     return rest.splitlines()[0].strip() if rest.strip() else ""
 
 
-def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr"):
+def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr", notice_attempts=0):
     target = "--pr" if mode == "pr" else "--issue"
     verb = "reviewing" if mode == "pr" else "triaging"
     cmd = [REVIEW_BIN, "--owner", owner, "--repo", repo, "--mode", mode, target, str(num),
@@ -226,6 +228,11 @@ def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr"):
         cmd += ["--confidence-bar", bar]
     if focus:
         cmd += ["--focus", focus]
+    if notice_attempts:
+        # Final automatic attempt: the reviewer posts its own in-band give-up notice if
+        # it aborts (single attempt, no retry — a lost notice is accepted over keeping a
+        # delivery state machine here).
+        cmd += ["--post-failure-notice", str(notice_attempts)]
     log(f"{verb} {owner}/{repo}#{num} (harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r})")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -233,6 +240,14 @@ def run_review(owner, repo, num, harness, depth, bar, focus, mode="pr"):
         return False
     log(f"{mode} done {owner}/{repo}#{num}: {proc.stdout.strip()}")
     return True
+
+
+def notice_attempts_for(prior_fails):
+    """The reviewer posts its own give-up notice on the FINAL automatic attempt only —
+    earlier failures stay silent so a transient error can heal on the next tick without
+    spamming the thread. Returns the attempt number to disclose, or 0 (no notice)."""
+    attempt = prior_fails + 1
+    return attempt if attempt >= MAX_FAILS else 0
 
 
 def post_parked(owner, repo, pr, rounds, token):
@@ -366,7 +381,8 @@ def main():
                 log(f"[dry-run] would review {slug}#{num}: harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r} (trigger {key})")
                 reviews_done += 1
                 continue
-            ok = run_review(owner, repo, num, harness, depth, bar, focus)
+            ok = run_review(owner, repo, num, harness, depth, bar, focus,
+                            notice_attempts=notice_attempts_for(answered.get(key, {}).get("fails", 0)))
             if ok:
                 answered[key] = {"status": "done", "sha": head_sha}
                 reviews_done += 1
@@ -376,6 +392,8 @@ def main():
                 rec["status"] = "given-up" if rec["fails"] >= MAX_FAILS else "failing"
                 answered[key] = rec
                 if rec["status"] == "given-up":
+                    # The reviewer posted its own in-band notice on this final attempt
+                    # (or logged why it could not — accepted single-attempt loss).
                     log(f"giving up on {key} after {rec['fails']} failures")
             save_state(state)
 
@@ -423,7 +441,8 @@ def main():
                 log(f"[dry-run] would triage {slug}#{num}: harness={harness} depth={depth} bar={bar or 'default'} focus={focus!r} (trigger {key})")
                 reviews_done += 1
                 continue
-            ok = run_review(owner, repo, num, harness, depth, bar, focus, mode="issue")
+            ok = run_review(owner, repo, num, harness, depth, bar, focus, mode="issue",
+                            notice_attempts=notice_attempts_for(answered.get(key, {}).get("fails", 0)))
             if ok:
                 answered[key] = {"status": "done"}
                 reviews_done += 1
@@ -433,6 +452,8 @@ def main():
                 rec["status"] = "given-up" if rec["fails"] >= MAX_FAILS else "failing"
                 answered[key] = rec
                 if rec["status"] == "given-up":
+                    # The reviewer posted its own in-band notice on this final attempt
+                    # (or logged why it could not — accepted single-attempt loss).
                     log(f"giving up on {key} after {rec['fails']} failures")
             save_state(state)
 
