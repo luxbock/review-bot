@@ -77,6 +77,15 @@ STAGE_RE = re.compile(r"^(\S+) (\d+)→(\d+)$")
 # from "the diff was empty" — a 0-char diff reports `inlined` under ANY cap, since the
 # comparison is `0 <= cap`. Capturing the measured size is what makes that visible.
 DIFF_LOG_RE = re.compile(r"diff (\d+) chars vs cap (\d+) — ")
+# review.py's per-empty-finder journal line. An empty draft is the event this experiment
+# exists to explain, and the footer's `0→0` is silent about WHY the finder came back
+# empty; this carries the engine's own output and how it parsed, so a rare empty cell is
+# explainable from the record instead of only reproducible by re-running.
+EMPTY_DIAG_RE = re.compile(r"empty-finder diagnostic: (\{.*\})\s*$", re.MULTILINE)
+EMPTY_DIAG_UNPARSED_LIMIT = 4000
+# review.py's VERDICT_LABEL keys, mirrored for the same reason describe_empty_diag mirrors
+# empty_finder_is_genuine: this tool drives the built binary and cannot import review.py.
+VERDICT_VALUES = ("approve", "comment", "request_changes")
 
 
 def die(msg, code=1) -> NoReturn:
@@ -243,7 +252,59 @@ def run_once(binary, args, harness, mode_label, cap, run_index, head):
         record["stderr_tail"] = "\n".join((proc.stderr or "").strip().splitlines()[-10:])
     else:
         record["aborted"] = False
+        if parsed["draft_findings"] == 0:
+            record["empty_finder_diag"] = parse_empty_diag(proc.stderr)
+            if record["empty_finder_diag"] is None:
+                # An older binary predates the diagnostic; keep the tail so the run is
+                # still worth something rather than silently indistinguishable.
+                record["stderr_tail"] = "\n".join(
+                    (proc.stderr or "").strip().splitlines()[-20:]
+                )
     return record
+
+
+def parse_empty_diag(stderr):
+    """The reviewer's empty-finder JSON, or None when the line is absent."""
+    m = EMPTY_DIAG_RE.search(stderr or "")
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return {"unparsed": m.group(1)[:EMPTY_DIAG_UNPARSED_LIMIT]}
+
+
+def describe_empty_diag(record):
+    """One line separating the two ways a run reaches zero drafts: the engine answering
+    `approve` with an explicit empty list, versus normalize() defaulting its way there
+    from an object that was never a review."""
+    diag = record.get("empty_finder_diag")
+    if not diag:
+        return "no diagnostic recorded (binary predates it?)"
+    parse = diag.get("parse") or {}
+    if not parse:
+        return "engine output never parsed as JSON"
+    mode = diag.get("mode", "pr")
+    # Mirrors review.py's empty_finder_is_genuine. Duplicated rather than imported: this
+    # tool drives the BUILT binary, and review.py in-tree carries build placeholders.
+    # Either tell suffices — an EXPLICITLY EMPTY list (a non-empty one that still reached
+    # zero drafts means normalize* discarded its entries), or (PR mode only, since the
+    # audit schema carries none) a recognised verdict with no `findings` key at all.
+    # `null` counts: normalize* collapses it to [] identically. The other falsy shapes
+    # ({} / "" / 0) collapse the same way but are malformed rather than answers.
+    kind, length = parse.get("findings_kind"), parse.get("findings_len")
+    genuine = (kind == "null" or (length == 0 if kind == "list" else
+               mode != "repo" and kind == "missing"
+               and parse.get("verdict_raw") in VERDICT_VALUES))
+    label = "genuine empty result" if genuine else "DEFAULTED — not a real result object"
+    verdict = ("verdict n/a (audit schema)" if mode == "repo"
+               else f"verdict {parse.get('verdict_raw')!r}")
+    retry = ", after a repair retry" if diag.get("repair_retried") else ""
+    shown = (f"list of {length} — every entry discarded by normalize"
+             if kind == "list" and length else kind)
+    return (f"{label}: {verdict}, findings {shown}, "
+            f"via {parse.get('path')}, keys {','.join(parse.get('keys') or []) or '(none)'}"
+            f"{retry}")
 
 
 def cell_ok(record):
@@ -370,11 +431,21 @@ def main(argv=None):
                     else:
                         log(f"  {record['draft_findings']}→{record['surviving_findings']} "
                             f"({record['diff_mode']}, {record['diff_chars']} chars)")
+                        if record["draft_findings"] == 0:
+                            log(f"  {describe_empty_diag(record)}")
 
     print()
     print(f"{args.owner}/{args.repo}#{args.pr} @ {head[:12]} — depth {args.depth}, "
           f"bar {args.confidence_bar}, {args.runs} run(s) per cell")
     print(summarize(records))
+    empties = [r for r in records if cell_ok(r) and r["draft_findings"] == 0]
+    if empties:
+        print()
+        print(f"empty finders ({len(empties)}) — the raw engine output for each is in "
+              f"{args.out} under `empty_finder_diag`:")
+        for r in empties:
+            print(f"  {r['harness']:6} {r['input_mode']:14} run {r['run']}: "
+                  f"{describe_empty_diag(r)}")
     print()
     print(f"{len(records)} run(s) written to {args.out}")
     return 0

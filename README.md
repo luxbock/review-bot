@@ -61,6 +61,74 @@ after its confidence-bar sentence:
 
 If verification instead checks a non-empty draft and removes every finding, the
 review says `All N draft finding(s) were checked and dropped by the verification stage.`
+
+### The empty-finder diagnostic
+
+The disclosure above says *that* the finder was empty; it cannot say **why**, and
+there are two causes needing opposite fixes:
+
+1. the engine genuinely answered `{"verdict":"approve","findings":[]}`, or
+2. `normalize()` manufactured that answer. It defaults an absent `verdict` to
+   `comment` and an absent or non-list `findings` to `[]`, so any balanced
+   `{...}` scraped out of a prose reply — a schema fragment the engine was
+   quoting back, say — parses as a clean, finding-free review with no other trace.
+
+So every empty finder journals what the engine actually emitted (**stderr only** —
+the posted comment is unchanged):
+
+```
+review-bot-review: EMPTY FINDER (claude, pr mode): genuine empty result. Zero drafts;
+  verify stage skipped. parse-path envelope-result, verdict 'approve' (present),
+  findings list, top-level keys findings,summary,verdict
+review-bot-review: empty-finder diagnostic: {"harness": "claude", "parse": {…}, "raw_excerpt": "…", …}
+```
+
+The second line is one JSON object: the harness, the raw output size and a
+head+tail excerpt of it (4000 chars, with the elided count stated), whether the
+JSON-repair retry fired, and — the discriminator — the *pre-normalization* facts
+`verdict_present`, `verdict_raw`, `findings_kind`, `findings_len`, `keys` and the
+`path` by which the JSON was reached, plus the `mode` that ran. Case 1 shows
+`findings_kind: "list"` with `findings_len: 0` (or, in PR mode, a recognised `verdict_raw`
+and no `findings` key); case 2 shows the keys of whatever was actually scraped.
+
+The discriminator follows the schema of the mode that ran, and **either tell suffices**:
+
+- an **explicitly empty** `findings` list — the universal one, and the audit schema's only
+  one, since it carries no `verdict` by design (`AUDIT_SCHEMA_HINT`, `normalize_audit`);
+  demanding a verdict there would report every clean repo audit as a parse pathology. The
+  list must have been empty as sent: `normalize*` silently drops non-dict entries, so a
+  list that was non-empty and still reached zero drafts is manufacturing, not answering,
+  and the journal line says `list of N — every entry discarded by normalize`.
+- `"findings": null` — recorded as `findings_kind: "null"` and counted as an answer, since
+  `normalize*`'s `obj.get("findings") or []` collapses it to the empty-list case
+  identically and it is the one non-list shape an engine plausibly means as "no findings".
+  The other falsy shapes (`{}`, `""`, `0`) collapse the same way but are malformed rather
+  than answers, so they remain case 2.
+- in **PR mode**, a **recognised** `verdict` value with no `findings` key at all, so the
+  common shorthand `{"verdict":"approve","summary":…}` is not flagged. The *value* is
+  checked rather than mere presence, which keeps a quoted schema
+  (`"approve|comment|request_changes"`) from passing as an answer.
+Under `review-bot-serve` these land in the service journal; `poll.py` discards a
+successful review's stderr, so read the service unit, not the poller.
+
+**Triage has the same hole with a different key.** `normalize_triage` substitutes
+`needs-info` whenever the engine supplies no `disposition` *or* an unrecognised one, so a
+scraped fragment is posted as a confident triage nobody produced. Triage has no finder
+stage and no draft count, so the empty-finder trigger cannot see it; it gets its own
+trigger and its own line.
+
+Unlike a zero-draft PR finder, a triage **never** skips verification, and the verify
+result replaces the draft — so the trigger watches whichever call produced the object that
+is actually rendered (and synthesis, in a multi-harness run). The line names that stage and
+says whether its output is what gets posted; watching only the drafting call would announce
+`needs-info` while the comment said `genuine bug`.
+
+```
+review-bot-review: DEFAULTED TRIAGE (claude, verify stage): the engine supplied none;
+  normalize_triage substituted `needs-info` — this is the disposition being posted.
+  parse-path envelope-result, top-level keys file,line_start
+review-bot-review: defaulted-triage diagnostic: {"harness": "claude", "mode": "issue", …}
+```
 Review and audit footers also include a `findings` segment directly after the `bar`
 segment, with each generator harness's draft and surviving counts in pipeline
 order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
@@ -114,6 +182,14 @@ the PR head is re-read before every run and a moved head aborts the experiment
 instead of mixing two diffs into one cell. The summary table has one row per
 cell with the run count, aborted count, number of empty drafts, and the mean
 draft and surviving finding counts.
+
+A run whose finder came back empty additionally carries `empty_finder_diag` — the
+reviewer's own diagnostic (above), lifted off stderr — so a rare empty cell is
+explainable from the record instead of only reproducible by re-running. When the
+line is absent (a binary predating it) the field is `null` and the stderr tail is
+kept in its place; it is never inferred. After the summary table the harness
+prints one line per empty run classifying it as a *genuine empty result* or as
+`DEFAULTED — not a real result object`.
 
 **Target a PR whose diff against its merge base is non-empty.** Since #26
 `review.py` prefers the forge-recorded merge base, so a *merged* PR normally

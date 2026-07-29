@@ -85,7 +85,13 @@ def make_stub_engine(tmpdir, responses):
         f.write("    dst.write(str(index + 1) + '\\n')\n")
         f.write("if index >= len(responses):\n")
         f.write("    raise SystemExit('unexpected extra engine invocation')\n")
-        f.write("sys.stdout.write(json.dumps({'result': json.dumps(responses[index])}))\n")
+        # A response carrying __raw_result__ is emitted verbatim as the claude envelope's
+        # `result` string, which is how a prose (non-JSON) reply actually reaches review.py.
+        f.write("resp = responses[index]\n")
+        f.write("if isinstance(resp, dict) and '__raw_result__' in resp:\n")
+        f.write("    sys.stdout.write(json.dumps({'result': resp['__raw_result__']}))\n")
+        f.write("else:\n")
+        f.write("    sys.stdout.write(json.dumps({'result': json.dumps(resp)}))\n")
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IRWXU)
 
     os.environ["REVIEW_BOT_TEST_RESPONSES"] = responses_path
@@ -192,12 +198,46 @@ def run_pr_case(tmpdir, responses):
         return checkout, base
 
     review.prepare_checkout = prepare
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
         markdown, url = review.do_pr_review(
             _Args(), ["claude"], "medium", "(none provided)", "tok", auth=_Auth()
         )
     assert url is None and checkout.entered and checkout.exited
-    return markdown, invocation_count(count_path)
+    return markdown, invocation_count(count_path), err.getvalue()
+
+
+def run_issue_case(tmpdir, responses):
+    count_path = make_stub_engine(tmpdir, responses)
+    review = fresh_review()
+    wt, _base, head = make_git_tree(tmpdir)
+    checkout = RecordingCheckout(wt)
+    ISSUE = {
+        "number": 11, "title": "widget returns 0 for None",
+        "body": "Passing None yields 0 instead of an error.",
+        "user": {"login": "olli"}, "labels": [], "state": "open",
+    }
+
+    def fake_api(method, path, token, data=None):
+        if path.endswith("/issues/11"):
+            return ISSUE
+        if path == "repos/acme/widget":
+            return {"default_branch": "main"}
+        raise AssertionError(f"unexpected api path: {path}")
+
+    review.api = fake_api
+    review.api_paged = lambda path, token: []
+    review.prepare_head_checkout = (
+        lambda owner, repo, default_branch, auth, repo_dir=None: (checkout, head)
+    )
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        markdown, url = review.do_issue_triage(
+            _Args(mode="issue", issue=11, pr=None), ["claude"], "medium",
+            "(none provided)", "tok", auth=None,
+        )
+    assert url is None and checkout.entered and checkout.exited
+    return markdown, invocation_count(count_path), err.getvalue()
 
 
 def run_repo_case(tmpdir, responses):
@@ -209,12 +249,13 @@ def run_repo_case(tmpdir, responses):
     review.prepare_head_checkout = (
         lambda owner, repo, default_branch, auth, repo_dir=None: (checkout, head)
     )
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
         markdown, url = review.do_repo_audit(
             _Args(mode="repo"), ["claude"], "medium", "(none provided)", "tok", auth=None
         )
     assert url is None and checkout.entered and checkout.exited
-    return markdown, invocation_count(count_path)
+    return markdown, invocation_count(count_path), err.getvalue()
 
 
 EMPTY_REVIEW = {"verdict": "approve", "summary": "", "findings": []}
@@ -259,11 +300,30 @@ VERIFIED_ONE = {
     "findings": [REALISTIC_DRAFT["findings"][1]],
 }
 EMPTY_AUDIT = {"summary": "", "findings": []}
+# A prose reply whose only balanced {...} is an unrelated fragment — here the schema the
+# engine was quoting back. find_json_object scrapes it, normalize() defaults the absent
+# verdict and findings, and the run renders as a clean review nobody performed.
+DEGENERATE_PROSE = {
+    "__raw_result__": (
+        "I looked at the change. The schema I was asked to follow is:\n\n"
+        '{"file": "<path>", "line_start": 1, "severity": "minor"}\n\n'
+        "Overall the widget change reads fine to me."
+    )
+}
+
+
+def empty_finder_diag(stderr):
+    """The JSON review.py journals for an empty finder, or None when it did not fire."""
+    prefix = "empty-finder diagnostic: "
+    for line in stderr.splitlines():
+        if prefix in line:
+            return json.loads(line.split(prefix, 1)[1])
+    return None
 
 
 def test_empty_pr_skips_verify_and_discloses():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [EMPTY_REVIEW])
+        markdown, calls, _err = run_pr_case(tmp, [EMPTY_REVIEW])
     assert calls == 1, calls
     expected = (
         "No blocking issues found at or above the **medium** confidence bar.\n\n"
@@ -278,7 +338,7 @@ def test_empty_pr_skips_verify_and_discloses():
 
 def test_two_findings_verified_to_zero():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [REALISTIC_DRAFT, EMPTY_REVIEW])
+        markdown, calls, _err = run_pr_case(tmp, [REALISTIC_DRAFT, EMPTY_REVIEW])
     assert calls == 2, calls
     assert "All 2 draft finding(s) were checked and dropped by the verification stage." in markdown
     assert EMPTY_FINDER_DISCLOSURE not in markdown
@@ -288,7 +348,7 @@ def test_two_findings_verified_to_zero():
 
 def test_degenerate_two_findings_verified_to_one():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [DEGENERATE_DRAFT, VERIFIED_ONE])
+        markdown, calls, _err = run_pr_case(tmp, [DEGENERATE_DRAFT, VERIFIED_ONE])
     assert calls == 2, calls
     assert EMPTY_FINDER_DISCLOSURE not in markdown
     assert "draft finding(s) were checked and dropped" not in markdown
@@ -299,17 +359,63 @@ def test_degenerate_two_findings_verified_to_one():
 
 def test_empty_repo_audit_skips_verify_and_has_footer():
     with scratch_dir() as tmp:
-        markdown, calls = run_repo_case(tmp, [EMPTY_AUDIT])
+        markdown, calls, err = run_repo_case(tmp, [EMPTY_AUDIT])
     assert calls == 1, calls
     assert markdown.startswith("## 🤖 review-bot audit — acme/widget maintainability findings")
     assert "No maintainability findings at or above the **medium** confidence bar." in markdown
     assert "findings `claude 0→0`" in markdown
-    print("ok  4. empty repo audit: one call and audit provenance footer")
+    # The audit pipeline shares run_pipeline, so it gets the same diagnostic — but the
+    # audit schema carries NO verdict (normalize_audit / AUDIT_SCHEMA_HINT), so a
+    # verdict-keyed discriminator would call every clean audit a parse pathology and send
+    # an operator after a bug that is not there.
+    diag = empty_finder_diag(err)
+    assert diag is not None and diag["mode"] == "repo", diag
+    assert diag["parse"]["findings_kind"] == "list", diag
+    assert diag["parse"]["verdict_present"] is False, diag
+    assert "DEFAULTED" not in err and "ABSENT" not in err, err
+    assert "genuine empty result" in err and "verdict None (n/a, the audit schema" in err, err
+    print("ok  4. empty repo audit: diagnostic reads the audit schema, not the PR schema")
+
+
+def test_discarded_findings_entries_are_not_reported_as_genuine():
+    """normalize* silently drops non-dict entries, so an engine CAN send a non-empty
+    findings list and still reach zero drafts. That is normalize manufacturing the empty
+    result — case 2 — and must not be reported as the engine answering clean."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_repo_case(
+            tmp, [{"summary": "One concern.", "findings": ["unchecked index in parse_args"]}]
+        )
+    assert calls == 1, calls
+    assert "findings `claude 0\u21920`" in markdown, markdown
+    diag = empty_finder_diag(err)
+    assert diag["parse"]["findings_kind"] == "list", diag
+    assert diag["parse"]["findings_len"] == 1, diag
+    assert "DEFAULTED — not a real result object" in err, err
+    assert "genuine empty result" not in err, err
+    # The length is the whole tell, so the human line must not hide it behind a bare `list`.
+    assert "findings list of 1 — every entry discarded by normalize" in err, err
+    print("ok  5. entries discarded by normalize are reported as defaulted, with the count")
+
+
+def test_null_findings_counts_as_the_engine_answering_clean():
+    """normalize*'s `obj.get("findings") or []` makes `null` indistinguishable from `[]`,
+    and it is the one non-list shape an engine plausibly means as "no findings". Flagging
+    it would put a false DEFAULTED on every clean audit that spells it that way."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_repo_case(
+            tmp, [{"summary": "nothing found", "findings": None}]
+        )
+    assert calls == 1, calls
+    assert "findings `claude 0\u21920`" in markdown, markdown
+    diag = empty_finder_diag(err)
+    assert diag["parse"]["findings_kind"] == "null", diag
+    assert "genuine empty result" in err and "DEFAULTED" not in err, err
+    print("ok  6. a null findings value reads as the engine answering, not as a pathology")
 
 
 def test_green_nonempty_verdict_keeps_body_and_footer():
     with scratch_dir() as tmp:
-        markdown, calls = run_pr_case(tmp, [VERIFIED_ONE, VERIFIED_ONE])
+        markdown, calls, err = run_pr_case(tmp, [VERIFIED_ONE, VERIFIED_ONE])
     assert calls == 2, calls
     assert markdown.startswith("## 🤖 review-bot — ✅ no blocking issues")
     assert "### Findings (1)" in markdown
@@ -317,7 +423,204 @@ def test_green_nonempty_verdict_keeps_body_and_footer():
     assert EMPTY_FINDER_DISCLOSURE not in markdown
     assert "draft finding(s) were checked and dropped" not in markdown
     assert "findings `claude 1→1`" in markdown
-    print("ok  5. green verdict with a finding retains body and gains footer only")
+    # A non-empty finder journals nothing: the diagnostic marks a rare event, so it must
+    # stay rare enough to be worth grepping for.
+    assert empty_finder_diag(err) is None, err
+    print("ok  7. green verdict with a finding retains body and gains footer only")
+
+
+def test_genuine_empty_verdict_is_recorded_as_genuine():
+    with scratch_dir() as tmp:
+        _markdown, calls, err = run_pr_case(tmp, [EMPTY_REVIEW])
+    assert calls == 1, calls
+    diag = empty_finder_diag(err)
+    assert diag is not None, err
+    assert diag["harness"] == "claude" and diag["repair_retried"] is False, diag
+    parse = diag["parse"]
+    assert diag["mode"] == "pr", diag
+    assert parse["path"] == "envelope-result", parse
+    assert parse["verdict_present"] is True and parse["verdict_raw"] == "approve", parse
+    assert "genuine empty result" in err and "DEFAULTED" not in err, err
+    assert parse["findings_kind"] == "list" and parse["findings_len"] == 0, parse
+    assert parse["keys"] == ["findings", "summary", "verdict"], parse
+    # The excerpt is the untouched engine stdout — the claude envelope, escaping and all.
+    assert diag["raw_excerpt"].startswith('{"result":') and "approve" in diag["raw_excerpt"], diag
+    assert diag["raw_chars"] == len(diag["raw_excerpt"]), diag
+    print("ok  8. genuine empty verdict: diagnostic records an explicit approve")
+
+
+def test_verdict_only_approve_is_genuine_not_a_pathology():
+    """{"verdict":"approve","summary":…} with the empty array left out is a real approve.
+    Flagging it would send a reader after a parse bug that is not there."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_pr_case(
+            tmp, [{"verdict": "approve", "summary": "Nothing to flag."}]
+        )
+    assert calls == 1, calls
+    assert "findings `claude 0\u21920`" in markdown, markdown
+    diag = empty_finder_diag(err)
+    assert diag["parse"]["findings_kind"] == "missing", diag
+    assert diag["parse"]["verdict_raw"] == "approve", diag
+    assert "genuine empty result" in err and "DEFAULTED" not in err, err
+    print("ok  9. a verdict-only approve counts as genuine, not as a parse pathology")
+
+
+def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_pr_case(tmp, [DEGENERATE_PROSE])
+    assert calls == 1, calls  # the fragment parsed, so no repair retry fired
+    # Indistinguishable from test 6 in the posted comment — same disclosure, same footer.
+    assert EMPTY_FINDER_DISCLOSURE in markdown, markdown
+    assert "findings `claude 0→0`" in markdown
+    diag = empty_finder_diag(err)
+    assert diag is not None, err
+    assert diag["repair_retried"] is False, diag
+    parse = diag["parse"]
+    # …and fully distinguishable in the journal: neither review key was ever present.
+    assert parse["verdict_present"] is False and parse["verdict_raw"] is None, parse
+    assert parse["findings_kind"] == "missing" and parse["findings_len"] is None, parse
+    assert parse["keys"] == ["file", "line_start", "severity"], parse
+    assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
+    assert "DEFAULTED — not a real result object" in err, err
+    print("ok 10. degenerate parse renders identically but is recorded as defaulted")
+
+
+GOOD_TRIAGE = {
+    "disposition": "genuine-bug", "confidence": "high",
+    "summary": "None is silently coerced to a valid value.",
+    "assessment": "The new branch erases the caller's distinction between missing and zero.",
+    "grounding": "src/widget.py:2-3", "recommended_action": "Reject None explicitly.",
+}
+# The triage analogue of DEGENERATE_PROSE: prose whose only balanced {...} is a fragment.
+# normalize_triage posts a confident `needs-info` built from nothing.
+DEGENERATE_TRIAGE_PROSE = {
+    "__raw_result__": (
+        "Looking at the issue, the relevant shape is:\n\n"
+        '{"file": "src/widget.py", "line_start": 2}\n\n'
+        "I think this is a real defect worth fixing."
+    )
+}
+
+
+def defaulted_triage_diag(stderr):
+    prefix = "defaulted-triage diagnostic: "
+    for line in stderr.splitlines():
+        if prefix in line:
+            return json.loads(line.split(prefix, 1)[1])
+    return None
+
+
+def test_good_triage_journals_nothing():
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(tmp, [GOOD_TRIAGE, GOOD_TRIAGE])
+    assert calls == 2, calls
+    assert "🐛 genuine bug" in markdown, markdown
+    assert defaulted_triage_diag(err) is None, err
+    print("ok 12. a triage the engine actually produced journals nothing")
+
+
+def test_defaulted_triage_disposition_is_journalled():
+    """Triage NEVER skips verification, and the verify result replaces the draft — so the
+    call the trigger must watch is the one whose object actually gets rendered."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(tmp, [GOOD_TRIAGE, DEGENERATE_TRIAGE_PROSE])
+    assert calls == 2, calls
+    # normalize_triage built this header out of a fragment; nobody produced it.
+    assert "❓ needs more info" in markdown, markdown
+    diag = defaulted_triage_diag(err)
+    assert diag is not None, err
+    assert diag["mode"] == "issue", diag
+    assert diag["stage"] == "verify" and diag["posted"] is True, diag
+    assert diag["parse"]["disposition_present"] is False, diag
+    assert diag["parse"]["keys"] == ["file", "line_start"], diag
+    assert "I think this is a real defect" in diag["raw_excerpt"], diag
+    assert "DEFAULTED TRIAGE (claude, verify stage)" in err, err
+    assert "supplied none" in err and "this is the disposition being posted" in err, err
+    print("ok 13. a disposition defaulted at the verify stage is journalled")
+
+
+def test_a_draft_anomaly_that_verification_repaired_is_not_journalled():
+    """The inverse, and the reason the trigger cannot just watch the drafting call: it
+    would announce `needs-info` while the comment says `genuine bug` — a false claim of
+    exactly the kind this diagnostic exists to prevent."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(tmp, [DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE])
+    assert calls == 2, calls
+    assert "🐛 genuine bug" in markdown, markdown
+    assert defaulted_triage_diag(err) is None, err
+    assert "DEFAULTED TRIAGE" not in err, err
+    print("ok 14. a draft anomaly the verify stage repaired is not reported as defaulted")
+
+
+def test_unrecognised_triage_disposition_counts_as_defaulted():
+    """Present-but-unrecognised is coerced to `needs-info` too, and posts just as confidently."""
+    with scratch_dir() as tmp:
+        bogus = dict(GOOD_TRIAGE, disposition="probably-fine")
+        _markdown, _calls, err = run_issue_case(tmp, [bogus, bogus])
+    diag = defaulted_triage_diag(err)
+    assert diag is not None, err
+    assert diag["parse"]["disposition_present"] is True, diag
+    assert diag["parse"]["disposition_raw"] == "probably-fine", diag
+    assert "supplied 'probably-fine'" in err, err
+    print("ok 15. an unrecognised triage disposition is journalled, not silently coerced")
+
+
+def test_genuine_check_is_mode_aware():
+    """The one signal this diagnostic exists to give must not invert between modes."""
+    review = fresh_review()
+    empty_list = {"findings_kind": "list", "findings_len": 0,
+                  "verdict_present": False, "verdict_raw": None}
+    # Non-empty as sent, yet zero drafts survived: normalize* discarded every entry.
+    discarded = {"findings_kind": "list", "findings_len": 2,
+                 "verdict_present": False, "verdict_raw": None}
+    approve_with_discarded = {"findings_kind": "list", "findings_len": 1,
+                              "verdict_present": True, "verdict_raw": "approve"}
+    # The common shorthand: a real approve with the empty array left out.
+    verdict_only = {"findings_kind": "missing", "findings_len": None,
+                    "verdict_present": True, "verdict_raw": "approve"}
+    # A quoted schema is present but is not an answer.
+    schema_echo = {"findings_kind": "missing", "verdict_present": True,
+                   "verdict_raw": "approve|comment|request_changes"}
+    scraped = {"findings_kind": "missing", "verdict_present": False, "verdict_raw": None}
+    # An explicit empty list is the universal tell — the audit schema has nothing else.
+    assert review.empty_finder_is_genuine(empty_list, "repo") is True
+    assert review.empty_finder_is_genuine(empty_list, "pr") is True
+    # A recognised verdict stands alone in PR mode, but the audit schema carries none,
+    # so it can never be the evidence there.
+    assert review.empty_finder_is_genuine(verdict_only, "pr") is True
+    assert review.empty_finder_is_genuine(verdict_only, "repo") is False
+    # Present but not a value: checking presence alone would pass this.
+    assert review.empty_finder_is_genuine(schema_echo, "pr") is False
+    # Neither tell, in either mode.
+    assert review.empty_finder_is_genuine(scraped, "repo") is False
+    assert review.empty_finder_is_genuine(scraped, "pr") is False
+    assert review.empty_finder_is_genuine({}, "pr") is False
+    # A list that arrived non-empty is manufacturing, in either mode — and a real verdict
+    # alongside discarded entries must not paper over them.
+    assert review.empty_finder_is_genuine(discarded, "repo") is False
+    assert review.empty_finder_is_genuine(discarded, "pr") is False
+    assert review.empty_finder_is_genuine(approve_with_discarded, "pr") is False
+    # `null` is an answer in either mode; the other falsy shapes normalize the same way
+    # but are malformed, so they stay pathologies.
+    null_findings = {"findings_kind": "null", "findings_len": None,
+                     "verdict_present": False, "verdict_raw": None}
+    assert review.empty_finder_is_genuine(null_findings, "repo") is True
+    assert review.empty_finder_is_genuine(null_findings, "pr") is True
+    for junk in ("dict", "str", "int"):
+        assert review.empty_finder_is_genuine(
+            {"findings_kind": junk, "verdict_present": False, "verdict_raw": None}, "repo"
+        ) is False, junk
+    print("ok 16. the genuine/defaulted check follows the schema of the mode that ran")
+
+
+def test_raw_excerpt_clips_head_and_tail():
+    review = fresh_review()
+    long_text = "A" * 3000 + "MIDDLE" + "Z" * 3000
+    clipped = review._clip(long_text, limit=100)
+    assert clipped.startswith("A" * 50) and clipped.endswith("Z" * 50), clipped
+    assert "MIDDLE" not in clipped and "5906 chars elided" in clipped, clipped
+    assert review._clip("short", limit=100) == "short"
+    print("ok 11. raw excerpt keeps both ends and states how much it dropped")
 
 
 def main():
@@ -326,7 +629,18 @@ def main():
         test_two_findings_verified_to_zero,
         test_degenerate_two_findings_verified_to_one,
         test_empty_repo_audit_skips_verify_and_has_footer,
+        test_discarded_findings_entries_are_not_reported_as_genuine,
+        test_null_findings_counts_as_the_engine_answering_clean,
         test_green_nonempty_verdict_keeps_body_and_footer,
+        test_genuine_empty_verdict_is_recorded_as_genuine,
+        test_verdict_only_approve_is_genuine_not_a_pathology,
+        test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted,
+        test_raw_excerpt_clips_head_and_tail,
+        test_good_triage_journals_nothing,
+        test_defaulted_triage_disposition_is_journalled,
+        test_a_draft_anomaly_that_verification_repaired_is_not_journalled,
+        test_unrecognised_triage_disposition_counts_as_defaulted,
+        test_genuine_check_is_mode_aware,
     ]
     for test in tests:
         test()

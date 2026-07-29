@@ -841,25 +841,200 @@ REFORMAT_INSTRUCTION = (
 )
 
 
+# ── empty-finder diagnostics (issue #21) ──────────────────────────────────────
+# A finder that returns zero drafts skips verification entirely (run_pipeline), so the
+# review renders as clean off a stage that never produced anything. The rendered footer's
+# `0→0` cannot say WHICH of two very different things happened:
+#   1. the engine genuinely answered {"verdict":"approve","findings":[]}, or
+#   2. normalize() manufactured that answer from something else — it defaults a missing
+#      `verdict` to "comment" and a missing/non-list `findings` to [], so an unrelated
+#      JSON fragment scraped out of a prose reply parses as a clean review.
+# Those need opposite fixes, so record the evidence when it happens rather than re-running
+# the pipeline blind afterwards. Journal only: the posted comment is unchanged.
+# Triage has the same hole with a different key: normalize_triage defaults an absent or
+# unrecognised `disposition` to "needs-info", so a scraped fragment becomes a confident,
+# posted disposition. It has no finder stage, so it needs its own trigger and prefix.
+EMPTY_FINDER_DIAG_PREFIX = "empty-finder diagnostic: "
+TRIAGE_DIAG_PREFIX = "defaulted-triage diagnostic: "
+EMPTY_FINDER_RAW_LIMIT = 4000
+_MISSING = object()
+
+
+def _clip(text, limit=EMPTY_FINDER_RAW_LIMIT):
+    """Head+tail excerpt: a degenerate reply can hide its tell at either end."""
+    if text is None or len(text) <= limit:
+        return text
+    half = limit // 2
+    return f"{text[:half]}\n…[{len(text) - limit} chars elided]…\n{text[-half:]}"
+
+
+def _describe_parsed(obj, path):
+    """What the PRE-normalization object carried — the part normalize() erases."""
+    if not isinstance(obj, dict):
+        return {"path": path, "type": type(obj).__name__}
+    findings = obj.get("findings", _MISSING)
+    if findings is _MISSING:
+        kind, length = "missing", None
+    elif findings is None:
+        # Distinguished from the other non-list shapes on purpose: `null` is the one an
+        # engine plausibly means as "no findings", and normalize*'s `obj.get("findings")
+        # or []` already collapses it to exactly the empty-list case.
+        kind, length = "null", None
+    elif isinstance(findings, list):
+        kind, length = "list", len(findings)
+    else:
+        kind, length = type(findings).__name__, None
+    verdict = obj.get("verdict", _MISSING)
+    disposition = obj.get("disposition", _MISSING)
+    return {
+        "path": path,
+        "keys": sorted(str(k) for k in obj),
+        "verdict_raw": None if verdict is _MISSING else verdict,
+        "verdict_present": verdict is not _MISSING,
+        "disposition_raw": None if disposition is _MISSING else disposition,
+        "disposition_present": disposition is not _MISSING,
+        "findings_kind": kind,
+        "findings_len": length,
+    }
+
+
+def _fill_diag(diag, **fields):
+    if isinstance(diag, dict):
+        diag.update(fields)
+
+
+def _describe_findings(parse):
+    """`findings` as the engine sent it. The length matters and is easy to miss: this line
+    is only ever printed when zero drafts survived, so a non-zero length means normalize*
+    discarded every entry — say so instead of printing a bare `list`."""
+    kind = parse.get("findings_kind", "(none)")
+    length = parse.get("findings_len")
+    if kind != "list" or not length:
+        return kind
+    return f"list of {length} — every entry discarded by normalize"
+
+
+def empty_finder_is_genuine(parse, mode):
+    """Did the engine really answer with an empty result, or did normalize() default its
+    way there? Either tell is sufficient, and each mode has its own:
+
+    - an explicit empty `findings` list — the universal one; the audit schema has nothing
+      else, since it carries no `verdict` by design (AUDIT_SCHEMA_HINT, normalize_audit),
+      so demanding one there would report every clean audit as a parse pathology;
+    - `"findings": null`, which normalize* collapses to [] identically and which an engine
+      plausibly means as "no findings". The other falsy shapes ({} / "" / 0) collapse the
+      same way but are malformed rather than answers, so they stay pathologies;
+    - a RECOGNISED `verdict` with NO `findings` key at all, in PR mode. Requiring a list as
+      well would flag the common shorthand {"verdict":"approve","summary":…} — a real
+      approve with the empty array left out — as a pathology, sending a reader after a bug
+      that is not there. Checking the verdict's value rather than mere presence is what
+      keeps a quoted schema ("approve|comment|request_changes") from passing as an answer.
+      `missing` rather than "any non-list" is what holds those malformed falsy shapes out
+      of this escape hatch; discarded entries are already caught by the list branch."""
+    if not parse:
+        return False
+    kind = parse.get("findings_kind")
+    if kind == "null":
+        return True
+    if kind == "list":
+        # An EXPLICITLY empty list. A list that was non-empty and still reached zero
+        # drafts means normalize* discarded every entry (both silently `continue` past a
+        # non-dict), which is manufacturing, not answering — the case this exists to catch.
+        return parse.get("findings_len") == 0
+    return mode != "repo" and kind == "missing" and parse.get("verdict_raw") in VERDICT_LABEL
+
+
+def log_empty_finder_diagnostic(harness, diag):
+    """Journal what the engine actually emitted, human line first then one JSON line."""
+    diag = diag or {}
+    parse = diag.get("parse") or {}
+    mode = diag.get("mode", "pr")
+    call = (
+        "genuine empty result"
+        if empty_finder_is_genuine(parse, mode)
+        else "DEFAULTED — not a real result object"
+    )
+    if mode == "repo":
+        verdict_note = "n/a, the audit schema carries none"
+    else:
+        verdict_note = "present" if parse.get("verdict_present") else "ABSENT — defaulted"
+    retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
+    log(
+        f"EMPTY FINDER ({harness}, {mode} mode): {call}. Zero drafts{retry} "
+        f"verify stage skipped. parse-path {parse.get('path', '(unparsed)')}, "
+        f"verdict {parse.get('verdict_raw')!r} ({verdict_note}), "
+        f"findings {_describe_findings(parse)}, "
+        f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
+    )
+    log(EMPTY_FINDER_DIAG_PREFIX + json.dumps(diag, sort_keys=True, default=str))
+
+
+def triage_disposition_was_defaulted(parse):
+    """Did the POSTED disposition come from the engine, or from us? normalize_triage
+    substitutes `needs-info` both when `disposition` is absent and when it is present but
+    unrecognised, so either case posts a confident disposition nobody produced — the
+    triage analogue of an empty finder rendering as a confident green."""
+    if not parse:
+        return False
+    if not parse.get("disposition_present"):
+        return True
+    return parse.get("disposition_raw") not in DISPOSITIONS
+
+
+def log_defaulted_triage_diagnostic(harness, diag, stage, posted):
+    """Triage has no finder stage and no draft count, so the empty-finder trigger cannot see
+    this. Same evidence, same journal-only sink, different trigger.
+
+    `stage` names the call whose output defaulted and `posted` says whether that output is
+    what the reader will see — a triage always verifies, and in a multi-harness run
+    synthesis has the last word, so claiming "this was posted" from any single call would
+    be a false claim of exactly the kind this whole diagnostic exists to prevent."""
+    diag = diag or {}
+    parse = diag.get("parse") or {}
+    raw = parse.get("disposition_raw")
+    cause = "supplied none" if not parse.get("disposition_present") else f"supplied {raw!r}"
+    retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
+    where = (
+        "this is the disposition being posted"
+        if posted
+        else "this harness's contribution to the synthesis stage"
+    )
+    log(
+        f"DEFAULTED TRIAGE ({harness}, {stage} stage): the engine {cause}{retry} "
+        f"normalize_triage substituted `needs-info` — {where}. "
+        f"parse-path {parse.get('path', '(unparsed)')}, "
+        f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
+    )
+    log(TRIAGE_DIAG_PREFIX + json.dumps(dict(diag, stage=stage, posted=posted),
+                                        sort_keys=True, default=str))
+
+
 def _parse_engine_output(raw, harness, key, norm):
-    """Raw engine stdout -> (normalized_obj_or_None, inner_text_for_a_repair_retry)."""
-    text = raw
+    """Raw engine stdout -> (normalized_obj_or_None, inner_text_for_a_repair_retry,
+    parse_facts_or_None). The third element records how the JSON was reached and what it
+    carried, for log_empty_finder_diagnostic."""
+    text, path = raw, "raw"
     if harness == "claude":
         # `claude -p --output-format json` wraps the answer in an envelope; the real
         # answer is the `result` string (which should itself be the review JSON).
         try:
             env = json.loads(raw)
             if isinstance(env, dict) and isinstance(env.get("result"), str):
-                text = env["result"]
+                text, path = env["result"], "envelope-result"
             elif isinstance(env, dict) and key in env:
-                return norm(env), text
+                return norm(env), text, _describe_parsed(env, "envelope-direct")
         except json.JSONDecodeError:
-            text = raw
+            text, path = raw, "raw"
     obj = find_json_object(text)
-    return (norm(obj) if obj is not None else None), text
+    if obj is None:
+        return None, text, None
+    return norm(obj), text, _describe_parsed(obj, path)
 
 
-def review_via(harness, prompt, cwd, dry_run, mode="pr"):
+def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
+    """`diag`, when a dict, is filled with the evidence log_empty_finder_diagnostic
+    needs. It is always filled and only sometimes read: whether this call was the finder,
+    and whether it came back empty, is known to the caller and not here."""
     raw = run_engine(harness, prompt, cwd, dry_run=dry_run)
     if dry_run or raw is None:
         return None
@@ -870,8 +1045,10 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr"):
     else:
         norm, key = normalize, "verdict"
 
-    result, text = _parse_engine_output(raw, harness, key, norm)
+    _fill_diag(diag, harness=harness, mode=mode, raw_chars=len(raw), raw_excerpt=_clip(raw))
+    result, text, parse = _parse_engine_output(raw, harness, key, norm)
     if result is not None:
+        _fill_diag(diag, repair_retried=False, parse=parse)
         return result
 
     # One JSON-repair retry. Engines occasionally answer in prose despite the prompt's
@@ -880,13 +1057,16 @@ def review_via(harness, prompt, cwd, dry_run, mode="pr"):
     # sound. Ask the engine to reformat its own prior output as strict JSON before giving
     # up: cheaper and more faithful than discarding the review or re-generating it.
     log(f"{harness} did not return parseable JSON; attempting one reformat retry")
+    _fill_diag(diag, repair_retried=True)
     schema_hint = {"issue": TRIAGE_SCHEMA_HINT, "repo": AUDIT_SCHEMA_HINT}.get(mode, REVIEW_SCHEMA_HINT)
     repaired = run_engine(
         harness, REFORMAT_INSTRUCTION.format(schema=schema_hint, prior=text[-6000:]), cwd
     )
     if repaired is not None:
-        result, _ = _parse_engine_output(repaired, harness, key, norm)
+        _fill_diag(diag, repair_chars=len(repaired), repair_excerpt=_clip(repaired))
+        result, _text, parse = _parse_engine_output(repaired, harness, key, norm)
         if result is not None:
+            _fill_diag(diag, parse=parse)
             return result
     die(f"could not parse a JSON result from {harness} output (even after a reformat retry):\n{text[-2000:]}")
 
@@ -1069,10 +1249,16 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
     results = []
     stages = []
     for h in harnesses:
-        r = review_via(h, gen_prompt, cdir, False, mode)
+        diag = {}
+        r = review_via(h, gen_prompt, cdir, False, mode, diag=diag)
         draft_count = None
+        stage = "draft"
         if r is not None and mode in ("pr", "repo"):
             draft_count = len(r["findings"])
+            if draft_count == 0:
+                # Verification is skipped just below for a zero-draft pr/repo finder, so
+                # this drafting call is unambiguously the object that gets rendered.
+                log_empty_finder_diagnostic(h, diag)
         should_verify = (
             depth != "quick"
             and r is not None
@@ -1080,9 +1266,16 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
             and not (mode in ("pr", "repo") and draft_count == 0)
         )
         if should_verify:
-            v = review_via(h, verify_fill(r), cdir, False, mode)
+            vdiag = {}
+            v = review_via(h, verify_fill(r), cdir, False, mode, diag=vdiag)
             if v is not None:
-                r = v
+                # The verify result REPLACES the draft, so from here on its parse is the
+                # one that describes this harness's contribution. Triage never skips
+                # verification, so watching only the draft would both miss a disposition
+                # defaulted here and misreport a draft anomaly that verification repaired.
+                r, diag, stage = v, vdiag, "verify"
+        if r is not None and mode == "issue" and triage_disposition_was_defaulted(diag.get("parse")):
+            log_defaulted_triage_diagnostic(h, diag, stage, posted=len(harnesses) == 1)
         if r is not None and draft_count is not None:
             stages.append(
                 {
@@ -1098,7 +1291,11 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
     provenance = {"stages": stages, "synthesized": len(results) > 1}
     if len(results) == 1:
         return results[0], provenance
-    synth = review_via(harnesses[0], synth_fill(results), cdir, False, mode)
+    synth_diag = {}
+    synth = review_via(harnesses[0], synth_fill(results), cdir, False, mode, diag=synth_diag)
+    if synth is not None and mode == "issue" and triage_disposition_was_defaulted(synth_diag.get("parse")):
+        # Synthesis is the last word in a multi-harness run — this one really is posted.
+        log_defaulted_triage_diagnostic(harnesses[0], synth_diag, "synthesis", posted=True)
     return (synth if synth is not None else results[0]), provenance
 
 
