@@ -36,9 +36,11 @@ Design authority: `notes/decisions/forgejo-multi-identity.md`,
 ## The one rule that makes the identity correct
 
 **Post the review with `review-bot-review` (REST + the review-bot token), NEVER with
-`fj`.** On this `agent` user `fj` is hard-wired to the **aatos** identity, so posting a
-review through `fj pr comment` / `fj issue comment` would mis-attribute it to aatos —
-exactly the self-review we avoid. The routine handles this for you (plain REST with the
+`fj`.** Wherever `fj` is provisioned it carries the **aatos** identity — on the `agent`
+user and in olli's bwrap-sandboxed sessions alike — so posting a review through
+`fj pr comment` / `fj issue comment` would mis-attribute it to aatos — exactly the
+self-review we avoid. This holds in every environment that renders the aatos
+credential, present or future, whichever user or sandbox you are running as. The routine handles this for you (plain REST with the
 review-bot token); do not "helpfully" fall back to `fj` for the review comment.
 
 Likewise: do **not** run `fj auth …` or hunt for a review-bot token — you don't hold
@@ -78,9 +80,10 @@ a time, so if it's busy your review simply queues (the command blocks until its 
 
 ### Agents: direct consult without a summoning comment
 
-Any agent on convox can invoke `review-bot-review` **directly** — it's on PATH. Prefer this
-over posting an `@review-bot` comment just to summon the bot, which litters the thread with
-a summons. Add **`--print-only`** to run the engines and get the review/triage back on
+Any agent session on convox — the `agent` user and olli's sandboxed sessions alike — can
+invoke `review-bot-review` **directly**: it's on PATH, and it reaches the service over its
+AF_UNIX socket from inside the bwrap wrap too. Prefer this over posting an `@review-bot`
+comment just to summon the bot, which litters the thread with a summons. Add **`--print-only`** to run the engines and get the review/triage back on
 stdout **without posting anything** to the forge — a pure consult. Drop `--print-only` when
 you do want the verdict left on the PR/issue for others. Either way it runs as the
 review-bot identity (its own token), which is correct regardless of who invoked it.
