@@ -129,7 +129,9 @@ def test_a_permanently_rejected_notice_stops_being_retried():
         assert api.attempts == 1, (code, api.attempts)
         assert rec["reported"] is True and rec["undeliverable"] == code, (code, rec)
     # 429 and 5xx stay retryable: those are the transient ones the retry exists for.
-    for code in (429, 500, 503):
+    # 401 belongs with the transient codes: the token can be rotated, and load_token()
+    # re-reads it every tick. A dead token is exactly when this path fires.
+    for code in (401, 429, 500, 503):
         poll = fresh_poll()
         api = RecordingApi(fail_times=99, code=code)
         poll.api = api
@@ -138,7 +140,23 @@ def test_a_permanently_rejected_notice_stops_being_retried():
             poll.flush_give_up_notices(answered, "tok")
         assert api.attempts == 3, (code, api.attempts)
         assert "reported" not in answered["m:acme/widget#7:c1"], code
-    print("ok  5. a permanent rejection stops; 429/5xx keep retrying")
+    print("ok  5. a permanent rejection stops; 401/429/5xx keep retrying")
+
+
+def test_even_a_retryable_rejection_is_eventually_abandoned():
+    """Nothing prunes the state map, so a token that is never rotated must not re-POST
+    forever either — the retryable set needs a terminating condition of its own."""
+    poll = fresh_poll()
+    api = RecordingApi(fail_times=999, code=401)
+    poll.api = api
+    answered = given_up(poll)
+    for _tick in range(poll.MAX_NOTICE_ATTEMPTS + 5):
+        poll.flush_give_up_notices(answered, "tok")
+    rec = answered["m:acme/widget#7:c1"]
+    assert api.attempts == poll.MAX_NOTICE_ATTEMPTS, api.attempts
+    assert rec["reported"] is True and rec["undeliverable"] == 401, rec
+    assert rec["notice_attempts"] == poll.MAX_NOTICE_ATTEMPTS, rec
+    print("ok  6. a retryable rejection is abandoned after MAX_NOTICE_ATTEMPTS")
 
 
 def test_dry_run_posts_nothing_and_leaves_it_pending():
@@ -149,7 +167,7 @@ def test_dry_run_posts_nothing_and_leaves_it_pending():
     poll.flush_give_up_notices(answered, "tok", dry=True)
     assert api.posts == [], api.posts
     assert "reported" not in answered["m:acme/widget#7:c1"]
-    print("ok  6. --dry-run reports the intent without posting or marking it delivered")
+    print("ok  7. --dry-run reports the intent without posting or marking it delivered")
 
 
 def test_only_unreported_give_ups_are_flushed():
@@ -167,7 +185,7 @@ def test_only_unreported_give_ups_are_flushed():
     }
     poll.flush_give_up_notices(answered, "tok")
     assert api.posts == [], api.posts
-    print("ok  7. done/failing/parked/already-reported/legacy records are left alone")
+    print("ok  8. done/failing/parked/already-reported/legacy records are left alone")
 
 
 def test_issue_triage_give_up_names_the_issue():
@@ -181,7 +199,7 @@ def test_issue_triage_give_up_names_the_issue():
     assert path == "repos/acme/widget/issues/11/comments", path
     assert "nothing here was triaged" in body, body
     assert "I tried to triage this" in body and "--issue 11" in body, body
-    print("ok  8. an issue triage give-up is reported on the issue, in triage wording")
+    print("ok  9. an issue triage give-up is reported on the issue, in triage wording")
 
 
 def test_feedback_classifies_the_notice_as_failed():
@@ -200,7 +218,7 @@ def test_feedback_classifies_the_notice_as_failed():
     assert feedback.FAIL_MARKER == poll.FAIL_MARKER, (feedback.FAIL_MARKER, poll.FAIL_MARKER)
     assert feedback.classify(body) == "failed", feedback.classify(body)
     assert "failed" in feedback.KINDS, feedback.KINDS
-    print("ok  9. review-bot-feedback classifies the notice as `failed`, not `other`")
+    print("ok 10. review-bot-feedback classifies the notice as `failed`, not `other`")
 
 
 def main():
@@ -210,6 +228,7 @@ def main():
         test_the_notice_says_nothing_was_reviewed_and_is_not_a_review,
         test_a_failed_post_is_retried_on_the_next_tick,
         test_a_permanently_rejected_notice_stops_being_retried,
+        test_even_a_retryable_rejection_is_eventually_abandoned,
         test_dry_run_posts_nothing_and_leaves_it_pending,
         test_only_unreported_give_ups_are_flushed,
         test_issue_triage_give_up_names_the_issue,

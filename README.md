@@ -94,8 +94,15 @@ for review-bot's reply, and a run that could not finish posted nothing at all. T
 carries no `REVIEW_MARKER`, so it is not counted as a review round, and
 `review-bot-feedback` classifies it as its own kind, `failed` — a caller filtering kinds
 can tell "no analysis happened" apart from a verdict. Only the error headline is relayed;
-the engine output `die()` appends stays in the journal. Delivery is recorded in the poll
-state, so a notice the forge rejects is retried on the next tick rather than lost.
+the engine output `die()` appends stays in the journal.
+
+Delivery is recorded in the poll state, since a give-up is terminal for its trigger and
+nothing else would reach it again. A rejection that a later tick could plausibly survive —
+`429`, any `5xx`, or `401` (the token expired or was revoked, and `load_token` re-reads it
+every tick) — is retried, up to `REVIEW_BOT_MAX_NOTICE_ATTEMPTS` (10). A rejection that
+cannot fix itself — `404` (issue deleted), `403` (repo archived, or write access lost) —
+is recorded as `undeliverable` and **not** retried, so that notice is lost; nothing prunes
+the state map, so an unbounded retry would re-POST and re-log on every tick forever.
 
 ### The empty-finder diagnostic
 

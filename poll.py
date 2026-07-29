@@ -60,6 +60,9 @@ DEFAULT_HARNESS = os.environ.get("REVIEW_BOT_DEFAULT_HARNESS", "claude")
 MAX_ROUNDS = int(os.environ.get("REVIEW_BOT_MAX_ROUNDS", "3"))
 MAX_PER_RUN = int(os.environ.get("REVIEW_BOT_MAX_PER_RUN", "3"))
 MAX_FAILS = int(os.environ.get("REVIEW_BOT_MAX_FAILS", "3"))
+# Delivery attempts for a give-up notice before it is abandoned. Only a backstop:
+# a permanently rejecting code stops on the first attempt.
+MAX_NOTICE_ATTEMPTS = int(os.environ.get("REVIEW_BOT_MAX_NOTICE_ATTEMPTS", "10"))
 
 # Footer substring present in EVERY real review (not in a parked notice) — used to count
 # review rounds and to recognise our own reviews. Must match render_markdown in review.py.
@@ -310,11 +313,24 @@ def flush_give_up_notices(answered, token, dry=False):
             # lost write access) — would re-POST and re-log forever. post_parked can
             # swallow every code alike because it only re-attempts while the PR is still
             # open at that head SHA; this has no such terminating condition.
-            if e.code == 429 or e.code >= 500:
-                log(f"could not post give-up notice for {key} (HTTP {e.code}) — retrying next tick")
-            else:
+            # 401 belongs with the transient codes: it means the token expired or was
+            # revoked, load_token() re-reads the file every tick (each tick is a fresh
+            # process), so a rotation genuinely fixes it — and a dead token is exactly
+            # when this fires, since run_review cannot post either, so every trigger
+            # marches to MAX_FAILS. Unlike a 404 it says nothing about the target.
+            attempts = rec["notice_attempts"] = rec.get("notice_attempts", 0) + 1
+            if e.code not in (401, 429) and e.code < 500:
                 rec["reported"], rec["undeliverable"] = True, e.code
                 log(f"give-up notice for {key} is undeliverable (HTTP {e.code}) — not retrying")
+            elif attempts >= MAX_NOTICE_ATTEMPTS:
+                # Backstop: nothing prunes `answered`, so even a retryable code needs a
+                # terminating condition or a never-rotated token re-POSTs forever.
+                rec["reported"], rec["undeliverable"] = True, e.code
+                log(f"giving up on the give-up notice for {key} after {attempts} attempts "
+                    f"(last HTTP {e.code})")
+            else:
+                log(f"could not post give-up notice for {key} (HTTP {e.code}, attempt "
+                    f"{attempts}/{MAX_NOTICE_ATTEMPTS}) — retrying next tick")
 
 
 def main():
@@ -454,6 +470,12 @@ def main():
                 if rec["status"] == "given-up":
                     log(f"giving up on {key} after {rec['fails']} failures")
                     record_give_up(rec, owner, repo, num, "pr", reason)
+                    # Persist the give-up BEFORE attempting delivery. api() raises a bare
+                    # TimeoutError/URLError on a transport failure, neither of which is an
+                    # HTTPError, so it escapes the flush and kills the tick — leaving the
+                    # `fails` increment unsaved and costing a full re-review next tick. The
+                    # notice is already on the record, so the top-of-tick flush delivers it.
+                    save_state(state)
                     flush_give_up_notices(answered, token)
             save_state(state)
 
@@ -513,6 +535,12 @@ def main():
                 if rec["status"] == "given-up":
                     log(f"giving up on {key} after {rec['fails']} failures")
                     record_give_up(rec, owner, repo, num, "issue", reason)
+                    # Persist the give-up BEFORE attempting delivery. api() raises a bare
+                    # TimeoutError/URLError on a transport failure, neither of which is an
+                    # HTTPError, so it escapes the flush and kills the tick — leaving the
+                    # `fails` increment unsaved and costing a full re-review next tick. The
+                    # notice is already on the record, so the top-of-tick flush delivers it.
+                    save_state(state)
                     flush_give_up_notices(answered, token)
             save_state(state)
 
