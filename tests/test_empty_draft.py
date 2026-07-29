@@ -430,6 +430,7 @@ def test_degenerate_parse_renders_clean_but_is_recorded_as_defaulted():
     assert parse["keys"] == ["file", "line_start", "severity"], parse
     assert "Overall the widget change reads fine" in diag["raw_excerpt"], diag
     assert "DEFAULTED — not a real result object" in err, err
+    print("ok  7. degenerate parse renders identically but is recorded as defaulted")
 
 
 GOOD_TRIAGE = {
@@ -467,21 +468,36 @@ def test_good_triage_journals_nothing():
 
 
 def test_defaulted_triage_disposition_is_journalled():
-    """normalize_triage substitutes `needs-info` for an absent disposition, so a scraped
-    fragment is posted as a confident triage nobody produced. Triage has no finder stage,
-    so the empty-finder trigger cannot see it."""
+    """Triage NEVER skips verification, and the verify result replaces the draft — so the
+    call the trigger must watch is the one whose object actually gets rendered."""
     with scratch_dir() as tmp:
-        markdown, calls, err = run_issue_case(tmp, [DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE])
-    # The posted comment is unchanged — this is the failure, and it is still invisible there.
-    assert "review-bot triage" in markdown, markdown
+        markdown, calls, err = run_issue_case(tmp, [GOOD_TRIAGE, DEGENERATE_TRIAGE_PROSE])
+    assert calls == 2, calls
+    # normalize_triage built this header out of a fragment; nobody produced it.
+    assert "❓ needs more info" in markdown, markdown
     diag = defaulted_triage_diag(err)
     assert diag is not None, err
     assert diag["mode"] == "issue", diag
+    assert diag["stage"] == "verify" and diag["posted"] is True, diag
     assert diag["parse"]["disposition_present"] is False, diag
     assert diag["parse"]["keys"] == ["file", "line_start"], diag
     assert "I think this is a real defect" in diag["raw_excerpt"], diag
-    assert "DEFAULTED TRIAGE" in err and "supplied none" in err, err
-    print(f"ok 11. an absent triage disposition is journalled ({calls} engine calls)")
+    assert "DEFAULTED TRIAGE (claude, verify stage)" in err, err
+    assert "supplied none" in err and "this is the disposition being posted" in err, err
+    print("ok 11. a disposition defaulted at the verify stage is journalled")
+
+
+def test_a_draft_anomaly_that_verification_repaired_is_not_journalled():
+    """The inverse, and the reason the trigger cannot just watch the drafting call: it
+    would announce `needs-info` while the comment says `genuine bug` — a false claim of
+    exactly the kind this diagnostic exists to prevent."""
+    with scratch_dir() as tmp:
+        markdown, calls, err = run_issue_case(tmp, [DEGENERATE_TRIAGE_PROSE, GOOD_TRIAGE])
+    assert calls == 2, calls
+    assert "🐛 genuine bug" in markdown, markdown
+    assert defaulted_triage_diag(err) is None, err
+    assert "DEFAULTED TRIAGE" not in err, err
+    print("ok 12. a draft anomaly the verify stage repaired is not reported as defaulted")
 
 
 def test_unrecognised_triage_disposition_counts_as_defaulted():
@@ -494,7 +510,7 @@ def test_unrecognised_triage_disposition_counts_as_defaulted():
     assert diag["parse"]["disposition_present"] is True, diag
     assert diag["parse"]["disposition_raw"] == "probably-fine", diag
     assert "supplied 'probably-fine'" in err, err
-    print("ok 12. an unrecognised triage disposition is journalled, not silently coerced")
+    print("ok 13. an unrecognised triage disposition is journalled, not silently coerced")
 
 
 def test_genuine_check_is_mode_aware():
@@ -512,8 +528,7 @@ def test_genuine_check_is_mode_aware():
     assert review.empty_finder_is_genuine(scraped, "repo") is False
     assert review.empty_finder_is_genuine(scraped, "pr") is False
     assert review.empty_finder_is_genuine({}, "pr") is False
-    print("ok  9. the genuine/defaulted check follows the schema of the mode that ran")
-    print("ok  7. degenerate parse renders identically but is recorded as defaulted")
+    print("ok 14. the genuine/defaulted check follows the schema of the mode that ran")
 
 
 def test_raw_excerpt_clips_head_and_tail():
@@ -523,7 +538,7 @@ def test_raw_excerpt_clips_head_and_tail():
     assert clipped.startswith("A" * 50) and clipped.endswith("Z" * 50), clipped
     assert "MIDDLE" not in clipped and "5906 chars elided" in clipped, clipped
     assert review._clip("short", limit=100) == "short"
-    print("ok  8. raw excerpt keeps both ends and states how much it dropped")
+    print("ok  9. raw excerpt keeps both ends and states how much it dropped")
 
 
 def main():
@@ -538,6 +553,7 @@ def main():
         test_raw_excerpt_clips_head_and_tail,
         test_good_triage_journals_nothing,
         test_defaulted_triage_disposition_is_journalled,
+        test_a_draft_anomaly_that_verification_repaired_is_not_journalled,
         test_unrecognised_triage_disposition_counts_as_defaulted,
         test_genuine_check_is_mode_aware,
     ]

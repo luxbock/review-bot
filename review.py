@@ -946,20 +946,32 @@ def triage_disposition_was_defaulted(parse):
     return parse.get("disposition_raw") not in DISPOSITIONS
 
 
-def log_defaulted_triage_diagnostic(harness, diag):
-    """Triage has no finder stage and no draft count, so the empty-finder trigger cannot
-    see this. Same evidence, same journal-only sink, different trigger."""
+def log_defaulted_triage_diagnostic(harness, diag, stage, posted):
+    """Triage has no finder stage and no draft count, so the empty-finder trigger cannot see
+    this. Same evidence, same journal-only sink, different trigger.
+
+    `stage` names the call whose output defaulted and `posted` says whether that output is
+    what the reader will see — a triage always verifies, and in a multi-harness run
+    synthesis has the last word, so claiming "this was posted" from any single call would
+    be a false claim of exactly the kind this whole diagnostic exists to prevent."""
     diag = diag or {}
     parse = diag.get("parse") or {}
     raw = parse.get("disposition_raw")
     cause = "supplied none" if not parse.get("disposition_present") else f"supplied {raw!r}"
     retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
+    where = (
+        "this is the disposition being posted"
+        if posted
+        else "this harness's contribution to the synthesis stage"
+    )
     log(
-        f"DEFAULTED TRIAGE ({harness}): the engine {cause}{retry} normalize_triage posted "
-        f"`needs-info` instead. parse-path {parse.get('path', '(unparsed)')}, "
+        f"DEFAULTED TRIAGE ({harness}, {stage} stage): the engine {cause}{retry} "
+        f"normalize_triage substituted `needs-info` — {where}. "
+        f"parse-path {parse.get('path', '(unparsed)')}, "
         f"top-level keys {','.join(parse.get('keys') or []) or '(none)'}"
     )
-    log(TRIAGE_DIAG_PREFIX + json.dumps(diag, sort_keys=True, default=str))
+    log(TRIAGE_DIAG_PREFIX + json.dumps(dict(diag, stage=stage, posted=posted),
+                                        sort_keys=True, default=str))
 
 
 def _parse_engine_output(raw, harness, key, norm):
@@ -1205,13 +1217,13 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
         diag = {}
         r = review_via(h, gen_prompt, cdir, False, mode, diag=diag)
         draft_count = None
+        stage = "draft"
         if r is not None and mode in ("pr", "repo"):
             draft_count = len(r["findings"])
             if draft_count == 0:
+                # Verification is skipped just below for a zero-draft pr/repo finder, so
+                # this drafting call is unambiguously the object that gets rendered.
                 log_empty_finder_diagnostic(h, diag)
-        elif r is not None and mode == "issue":
-            if triage_disposition_was_defaulted(diag.get("parse")):
-                log_defaulted_triage_diagnostic(h, diag)
         should_verify = (
             depth != "quick"
             and r is not None
@@ -1219,9 +1231,16 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
             and not (mode in ("pr", "repo") and draft_count == 0)
         )
         if should_verify:
-            v = review_via(h, verify_fill(r), cdir, False, mode)
+            vdiag = {}
+            v = review_via(h, verify_fill(r), cdir, False, mode, diag=vdiag)
             if v is not None:
-                r = v
+                # The verify result REPLACES the draft, so from here on its parse is the
+                # one that describes this harness's contribution. Triage never skips
+                # verification, so watching only the draft would both miss a disposition
+                # defaulted here and misreport a draft anomaly that verification repaired.
+                r, diag, stage = v, vdiag, "verify"
+        if r is not None and mode == "issue" and triage_disposition_was_defaulted(diag.get("parse")):
+            log_defaulted_triage_diagnostic(h, diag, stage, posted=len(harnesses) == 1)
         if r is not None and draft_count is not None:
             stages.append(
                 {
@@ -1237,7 +1256,11 @@ def run_pipeline(harnesses, gen_prompt, verify_fill, synth_fill, cdir, depth, mo
     provenance = {"stages": stages, "synthesized": len(results) > 1}
     if len(results) == 1:
         return results[0], provenance
-    synth = review_via(harnesses[0], synth_fill(results), cdir, False, mode)
+    synth_diag = {}
+    synth = review_via(harnesses[0], synth_fill(results), cdir, False, mode, diag=synth_diag)
+    if synth is not None and mode == "issue" and triage_disposition_was_defaulted(synth_diag.get("parse")):
+        # Synthesis is the last word in a multi-harness run — this one really is posted.
+        log_defaulted_triage_diagnostic(harnesses[0], synth_diag, "synthesis", posted=True)
     return (synth if synth is not None else results[0]), provenance
 
 

@@ -77,8 +77,9 @@ So every empty finder journals what the engine actually emitted (**stderr only**
 the posted comment is unchanged):
 
 ```
-review-bot-review: EMPTY FINDER (claude): zero drafts, verify stage skipped. parse-path
-  envelope-result, verdict 'approve' (present), findings list, top-level keys findings,summary,verdict
+review-bot-review: EMPTY FINDER (claude, pr mode): genuine empty result. Zero drafts;
+  verify stage skipped. parse-path envelope-result, verdict 'approve' (present),
+  findings list, top-level keys findings,summary,verdict
 review-bot-review: empty-finder diagnostic: {"harness": "claude", "parse": {…}, "raw_excerpt": "…", …}
 ```
 
@@ -102,11 +103,18 @@ successful review's stderr, so read the service unit, not the poller.
 `needs-info` whenever the engine supplies no `disposition` *or* an unrecognised one, so a
 scraped fragment is posted as a confident triage nobody produced. Triage has no finder
 stage and no draft count, so the empty-finder trigger cannot see it; it gets its own
-trigger and its own line:
+trigger and its own line.
+
+Unlike a zero-draft PR finder, a triage **never** skips verification, and the verify
+result replaces the draft — so the trigger watches whichever call produced the object that
+is actually rendered (and synthesis, in a multi-harness run). The line names that stage and
+says whether its output is what gets posted; watching only the drafting call would announce
+`needs-info` while the comment said `genuine bug`.
 
 ```
-review-bot-review: DEFAULTED TRIAGE (claude): the engine supplied none; normalize_triage
-  posted `needs-info` instead. parse-path envelope-result, top-level keys file,line_start
+review-bot-review: DEFAULTED TRIAGE (claude, verify stage): the engine supplied none;
+  normalize_triage substituted `needs-info` — this is the disposition being posted.
+  parse-path envelope-result, top-level keys file,line_start
 review-bot-review: defaulted-triage diagnostic: {"harness": "claude", "mode": "issue", …}
 ```
 Review and audit footers also include a `findings` segment directly after the `bar`
@@ -168,8 +176,8 @@ reviewer's own diagnostic (above), lifted off stderr — so a rare empty cell is
 explainable from the record instead of only reproducible by re-running. When the
 line is absent (a binary predating it) the field is `null` and the stderr tail is
 kept in its place; it is never inferred. After the summary table the harness
-prints one line per empty run classifying it as a *genuine empty verdict* or as
-`DEFAULTED — not a real review object`.
+prints one line per empty run classifying it as a *genuine empty result* or as
+`DEFAULTED — not a real result object`.
 
 **Target a PR whose diff against its merge base is non-empty.** Since #26
 `review.py` prefers the forge-recorded merge base, so a *merged* PR normally
