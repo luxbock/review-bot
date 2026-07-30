@@ -428,6 +428,77 @@ def test_replays_the_org_gtd_cli_52_case():
     print("ok  9. 3 files / 61,313 chars at cap 60,000 now inlines hunks, not nothing")
 
 
+# ── 10. the shapes git emits that are not a plain content change ─────────────
+def make_edge_case_tree(parent):
+    """A tree exercising every per-file diff shape that is not a plain edit."""
+    wt = os.path.join(parent, "edge-worktree")
+    os.makedirs(wt)
+    subprocess.run([GIT, "init", "-q", wt], check=True)
+    with open(os.path.join(wt, "renamed-from.txt"), "w") as f:
+        f.write("a\n" * 20)
+    with open(os.path.join(wt, "deleted.txt"), "w") as f:
+        f.write("gone\n")
+    with open(os.path.join(wt, "mode.sh"), "w") as f:
+        f.write("#!/bin/sh\n")
+    with open(os.path.join(wt, "file with space.txt"), "w") as f:
+        f.write("s\n")
+    with open(os.path.join(wt, "tricky.txt"), "w") as f:
+        f.write("z\n")
+    with open(os.path.join(wt, "pic.bin"), "wb") as f:
+        f.write(bytes(range(256)) * 4)
+    _git(wt, "add", "-A")
+    _git(wt, *GIT_ID, "commit", "-qm", "base")
+    base = _git(wt, "rev-parse", "HEAD").strip()
+
+    os.rename(os.path.join(wt, "renamed-from.txt"), os.path.join(wt, "renamed-to.txt"))
+    os.remove(os.path.join(wt, "deleted.txt"))
+    os.chmod(os.path.join(wt, "mode.sh"), 0o755)
+    with open(os.path.join(wt, "file with space.txt"), "a") as f:
+        f.write("more\n")
+    # Content that MIMICS diff headers: git prefixes every hunk line with ' '/'+'/'-',
+    # so neither line can be mistaken for a real header — pin that rather than assume it.
+    with open(os.path.join(wt, "tricky.txt"), "a") as f:
+        f.write("++ b/not-a-real-path.txt\n")
+        f.write("diff --git a/fake b/fake\n")
+    with open(os.path.join(wt, "new-file.txt"), "w") as f:
+        f.write("new\n")
+    with open(os.path.join(wt, "pic.bin"), "wb") as f:
+        f.write(bytes(range(255, -1, -1)) * 4)
+    _git(wt, "add", "-A")
+    _git(wt, *GIT_ID, "commit", "-qm", "change")
+    return wt, base
+
+
+def test_handles_renames_deletions_modes_binaries_and_odd_names():
+    with scratch_dir() as tmp:
+        review = fresh_review()
+        wt, base = make_edge_case_tree(tmp)
+        diff = diff_text(wt, base)
+        chunks = review.split_diff_by_file(diff)
+        numstat = _git(wt, "diff", "--numstat", f"{base}..HEAD").splitlines()
+
+        assert "".join(t for _, t in chunks) == diff, "splitting must round-trip exactly"
+        assert len(chunks) == len(numstat), (
+            f"{len(chunks)} chunks vs git's own {len(numstat)} files — a DiffMode "
+            "file count that disagrees with git would make the footer lie"
+        )
+        # A rename reports its NEW name; a deletion its surviving old name; a binary and
+        # a mode-only change have no ---/+++ pair at all and fall back to the header.
+        assert [p for p, _ in chunks] == [
+            "deleted.txt", "file with space.txt", "mode.sh", "new-file.txt",
+            "pic.bin", "renamed-to.txt", "tricky.txt",
+        ], [p for p, _ in chunks]
+
+        # Packing over this tree still lists exactly the files it left out.
+        sizes = {p: len(t) for p, t in chunks}
+        review.DIFF_INLINE_CAP = sum(sizes.values()) - sizes["tricky.txt"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+        assert mode.kind == "partial" and mode.total_files == len(numstat), mode
+        assert "- `tricky.txt`" in block, block[-300:]
+    print("ok 10. renames, deletions, mode changes, binaries and odd names all parse")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -438,6 +509,7 @@ TESTS = [
     test_empty_result_on_partial_input_takes_the_warning_branch,
     test_empty_result_on_partial_input_end_to_end,
     test_replays_the_org_gtd_cli_52_case,
+    test_handles_renames_deletions_modes_binaries_and_odd_names,
 ]
 
 
