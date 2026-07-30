@@ -228,11 +228,17 @@ can find, so the mode is disclosed rather than inferred:
 | `partial k/n files` | k whole files' hunks, plus the names of the other n−k (`, selected` when a ranking chose which k) |
 | `file-list` | no hunks at all — `git diff --stat` and the instruction to read the checkout |
 
-- a journal line, emitted before any engine runs —
-  `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars`
-  (the other two wordings are `— inlined` and `— file-list only`);
+- a journal line, emitted before the **finder** runs — on an over-cap diff the selection
+  stage has already run and logged its own `selecting inline order over N files …` line
+  above this one —
+  `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars (selection ranked 3: …)`
+  (the other two wordings are `— inlined` and `— file-list only`). A `partial` line
+  **always** carries a `(selection …)` suffix; it reads `(selection disabled)` when the
+  stage was off, `(selection disabled: dry run)` under `--dry-run`, and
+  `(selection failed: …)` when it degraded;
 - a review footer segment directly after `findings` and before `merge-base`:
-  ``diff `inlined` ``, ``diff `partial 3/9 files` `` or ``diff `file-list` ``.
+  ``diff `inlined` ``, ``diff `partial 3/9 files` `` (``diff `partial 3/9 files, selected` ``
+  when a ranking chose which k) or ``diff `file-list` ``.
 
 Whole files only: a half-diff is worse input than an honest omission, and the
 engine cannot tell the two apart unless it is told. When not even one file fits
