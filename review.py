@@ -64,6 +64,7 @@ TRIAGE_SYNTHESIS_PROMPT_FILE = "@TRIAGE_SYNTHESIS_PROMPT@"
 AUDIT_PROMPT_FILE = "@AUDIT_PROMPT@"
 AUDIT_VERIFY_PROMPT_FILE = "@AUDIT_VERIFY_PROMPT@"
 AUDIT_SYNTHESIS_PROMPT_FILE = "@AUDIT_SYNTHESIS_PROMPT@"
+SELECT_PROMPT_FILE = "@SELECT_PROMPT@"
 
 # ── Runtime config (env-overridable so olli can tune without a rebuild) ────────
 FORGE_URL = os.environ.get("FORGEJO_URL", "http://10.0.150.1:3000").rstrip("/")
@@ -112,6 +113,22 @@ CLAUDE_CMD = shlex.split(
     )
 )
 CODEX_CMD = shlex.split(os.environ.get("REVIEW_BOT_CODEX_CMD", "codex exec --skip-git-repo-check -"))
+# The file-selection stage (issue #35) runs on its own, deliberately CHEAP engine: it
+# only ranks metadata, so a haiku-tier model is the right tool and the cost of getting
+# the ranking slightly wrong is a worse packing order, never a wrong verdict. Separate
+# from REVIEW_BOT_CLAUDE_CMD so it can be tuned (or disabled with an empty value)
+# without touching the finder. No tool access: it is handed everything it may look at.
+SELECT_CMD = shlex.split(
+    os.environ.get("REVIEW_BOT_SELECT_CMD", "claude -p --output-format json --model haiku")
+)
+# A ranking of metadata is cheap; a stuck selection stage must never hold a review
+# hostage. Well under ENGINE_TIMEOUT on purpose.
+SELECT_TIMEOUT = int(os.environ.get("REVIEW_BOT_SELECT_TIMEOUT", "180"))
+# Journal/prompt bounds for the selection stage. The ranking is a hint, so all three of
+# these clip rather than fail: a pathological input degrades the hint, never the review.
+SELECT_JOURNAL_MAX = int(os.environ.get("REVIEW_BOT_SELECT_JOURNAL_MAX", "8"))
+SELECT_REASON_MAX = 120
+SELECT_MAX_HUNK_HEADERS = 40
 
 SEVERITY_ORDER = ["blocker", "major", "minor", "nit", "question"]
 SEVERITY_EMOJI = {
@@ -630,25 +647,43 @@ class DiffMode:
     Never re-derive any of these from a diff length downstream: the journal line, the
     footer segment and the empty-verdict calibration must all be the same measurement,
     or the disclosure can drift from the input the engine really got.
+
+    `selection` (issue #35) records whether the cheap ranking stage decided the packing
+    ORDER. It never decides scope — an unranked file is packed after the ranked ones and,
+    if it still does not fit, it is listed exactly as it would have been anyway.
     """
 
-    def __init__(self, kind, inlined_files, total_files, inlined_chars, total_chars):
+    def __init__(self, kind, inlined_files, total_files, inlined_chars, total_chars,
+                 selection=None):
         self.kind = kind
         self.inlined_files = inlined_files
         self.total_files = total_files
         self.inlined_chars = inlined_chars
         self.total_chars = total_chars
+        self.selection = selection
 
     @property
     def fully_inlined(self):
         return self.kind == "inlined"
 
     @property
+    def selected(self):
+        """True when a ranking actually shaped the order (not merely attempted)."""
+        return bool(self.selection and self.selection.ranked)
+
+    @property
     def footer_word(self):
         """The footer's ``diff `…` `` segment. Byte-identical to the pre-#34 wording in
-        the two states that existed then, so old and new footers stay comparable."""
+        the two states that existed then, so old and new footers stay comparable.
+
+        Counts only — the per-file reasons stay in the journal. They are a cheap
+        engine's prose about untrusted input, and the footer is the one place a human
+        reads a verdict; a paragraph of machine rationale there would compete with the
+        findings for attention while adding nothing a reader can act on.
+        """
         if self.kind == "partial":
-            return f"partial {self.inlined_files}/{self.total_files} files"
+            word = f"partial {self.inlined_files}/{self.total_files} files"
+            return f"{word}, selected" if self.selected else word
         return self.kind
 
     @property
@@ -656,13 +691,46 @@ class DiffMode:
         """The tail of the journal line. tools/finder_ab.py keys off the leading
         `diff <N> chars vs cap <C> — ` prefix only, so this wording is free to grow."""
         if self.kind == "partial":
-            return (
+            phrase = (
                 f"{self.inlined_files} of {self.total_files} files inlined, "
                 f"{self.inlined_chars} of {self.total_chars} chars"
             )
+            if self.selection:
+                phrase += f" ({self.selection.journal_phrase})"
+            return phrase
         if self.kind == "inlined":
             return "inlined"
         return "file-list only"
+
+
+class Selection:
+    """The cheap ranking stage's outcome (issue #35) — what WE chose to inline, which is
+    a fact we own, as opposed to what the finder claims to have read, which is a claim.
+
+    `ranked` is the accepted order (paths present in the diff, best first); empty means
+    the stage did not shape anything and packing fell back to source order. `status` says
+    why, so a missing ranking is always explainable from the journal: `ok`, `disabled`,
+    `failed`, `unparsed`, or `empty`.
+    """
+
+    def __init__(self, status, ranked=None, reasons=None, detail=""):
+        self.status = status
+        self.ranked = ranked or []
+        self.reasons = reasons or {}
+        self.detail = detail
+
+    @property
+    def journal_phrase(self):
+        if not self.ranked:
+            return f"selection {self.status}{f': {self.detail}' if self.detail else ''}"
+        listed = ", ".join(
+            f"{path}" + (f" — {self.reasons[path]}" if self.reasons.get(path) else "")
+            for path in self.ranked[:SELECT_JOURNAL_MAX]
+        )
+        more = len(self.ranked) - SELECT_JOURNAL_MAX
+        if more > 0:
+            listed += f", +{more} more"
+        return f"selection ranked {len(self.ranked)}: {listed}"
 
     def __repr__(self):
         return (
@@ -736,7 +804,132 @@ def pack_diff_chunks(chunks, cap):
     return kept, elided
 
 
-def changed_files_block(cdir, merge_base, auth):
+def diff_file_headers(chunks):
+    """The cheap metadata the selection stage ranks: per file, its `diff --git` header
+    line and its hunk headers (`@@ … @@`, which carry git's inferred function context).
+    No hunk bodies — that is the whole point of the stage being cheap."""
+    out = []
+    for path, text in chunks:
+        lines = text.splitlines()
+        head = lines[0] if lines else ""
+        hunks = [line for line in lines if line.startswith("@@")]
+        out.append(f"#### `{path}` ({len(text)} chars, {len(hunks)} hunk(s))")
+        out.append(f"    {head}")
+        # A pathological file (thousands of tiny hunks) must not blow the cheap stage's
+        # own prompt budget; the count above still tells it the shape.
+        for hunk in hunks[:SELECT_MAX_HUNK_HEADERS]:
+            out.append(f"    {hunk}")
+        if len(hunks) > SELECT_MAX_HUNK_HEADERS:
+            out.append(f"    … {len(hunks) - SELECT_MAX_HUNK_HEADERS} more hunk header(s)")
+        out.append("")
+    return "\n".join(out)
+
+
+def parse_selection(raw, known_paths):
+    """Turn the cheap engine's reply into (ranked_paths, reasons).
+
+    Everything here treats the reply as untrusted DATA: only paths that exist in this
+    diff survive, duplicates collapse, reasons are flattened to a single clipped line,
+    and nothing else in the object is read. A ranking cannot introduce a file, cannot
+    remove one, and structurally cannot become a finding — it only permutes the order
+    in which files are offered to the packer.
+    """
+    obj = find_json_object(raw or "")
+    if not isinstance(obj, dict):
+        return None, {}
+    entries = obj.get("files")
+    if not isinstance(entries, list):
+        return None, {}
+    ranked, reasons = [], {}
+    for entry in entries:
+        if isinstance(entry, str):
+            path, reason = entry, ""
+        elif isinstance(entry, dict):
+            path = entry.get("path")
+            reason = entry.get("reason") or ""
+        else:
+            continue
+        if not isinstance(path, str) or path not in known_paths or path in ranked:
+            continue
+        ranked.append(path)
+        if isinstance(reason, str) and reason.strip():
+            reasons[path] = " ".join(reason.split())[:SELECT_REASON_MAX]
+    return ranked, reasons
+
+
+def select_files_to_inline(chunks, stat, conv_str, cwd):
+    """Ask the cheap engine which files deserve the inline budget. Returns a `Selection`.
+
+    Every failure path degrades to an empty ranking (source order), never to a dead
+    review: the finder's own pass is what produces findings, and losing a *hint* is not
+    worth losing a review. The stage is invoked directly rather than through run_engine
+    because run_engine dies on a non-zero exit — correct for the finder, wrong here.
+    """
+    if not SELECT_CMD:
+        return Selection("disabled")
+    known = [path for path, _ in chunks]
+    try:
+        prompt = fill(
+            SELECT_PROMPT_FILE,
+            {
+                "STAT": stat,
+                "FILE_HEADERS": diff_file_headers(chunks),
+                "CONVENTION_FILES": conv_str,
+            },
+        )
+    except OSError as exc:
+        # Unreadable prompt file — e.g. review.py run straight from the checkout, where
+        # @SELECT_PROMPT@ is still a placeholder. The stage is a hint; it degrades like
+        # any other failure rather than taking the review down with it.
+        return Selection("failed", detail=f"prompt unavailable: {exc}"[:200])
+    log(f"selecting inline order over {len(known)} files ({SELECT_CMD[0]}) …")
+    try:
+        proc = subprocess.run(
+            SELECT_CMD, input=prompt, cwd=cwd, capture_output=True, text=True,
+            timeout=SELECT_TIMEOUT,
+        )
+    except FileNotFoundError:
+        return Selection("failed", detail=f"{SELECT_CMD[0]} not on PATH")
+    except subprocess.TimeoutExpired:
+        return Selection("failed", detail=f"timed out after {SELECT_TIMEOUT}s")
+    except OSError as exc:
+        return Selection("failed", detail=str(exc)[:200])
+    if proc.returncode != 0:
+        detail = ((proc.stderr or "").strip() or (proc.stdout or "").strip())[-200:]
+        return Selection("failed", detail=f"exited {proc.returncode}: {detail}")
+    raw = proc.stdout or ""
+    # The same envelope shape run_engine's callers unwrap: `claude -p --output-format
+    # json` returns {"result": "<the model's text>"}, so look inside before parsing.
+    envelope = find_json_object(raw)
+    if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
+        raw = envelope["result"]
+    ranked, reasons = parse_selection(raw, set(known))
+    if ranked is None:
+        return Selection("unparsed", detail=(proc.stdout or "").strip()[:200])
+    if not ranked:
+        return Selection("empty")
+    return Selection("ok", ranked=ranked, reasons=reasons)
+
+
+def apply_selection(chunks, ranked):
+    """Reorder chunks so ranked files come first, in ranked order; the rest keep source
+    order behind them. A stable permutation — no file is added or dropped, so the packer
+    still decides scope and every file remains in the block one way or the other."""
+    if not ranked:
+        return chunks
+    by_path = {}
+    for path, text in chunks:
+        by_path.setdefault(path, []).append((path, text))
+    first, seen = [], set()
+    for path in ranked:
+        if path in by_path and path not in seen:
+            first.extend(by_path[path])
+            seen.add(path)
+    rest = [(p, t) for p, t in chunks if p not in seen]
+    return first + rest
+
+
+def changed_files_block(cdir, merge_base, auth, conv_str="(none found)"):
     """Return (block, mode, stats) — the review prompt's diff input, the `DiffMode`
     saying how much of the diff that block actually carries, and the diff's size
     ({"files": N, "insertions": A, "deletions": D}) for the empty-verdict calibration.
@@ -747,7 +940,10 @@ def changed_files_block(cdir, merge_base, auth):
     actually saw.
 
     Over-cap diffs are packed per whole file (issue #34) instead of collapsing to the
-    file list entirely: a diff 2% over the cap used to lose 100% of its hunks.
+    file list entirely: a diff 2% over the cap used to lose 100% of its hunks. When the
+    packed diff still cannot hold everything, a cheap engine ranks the files first
+    (issue #35) so the budget goes to the hunks most worth reading — ORDER only: the
+    packer still decides what fits, and an unranked file is listed exactly as before.
     """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
@@ -764,11 +960,17 @@ def changed_files_block(cdir, merge_base, auth):
         deletions += int(parts[1]) if parts[1].isdigit() else 0
     stats = {"files": files, "insertions": insertions, "deletions": deletions}
     chunks = split_diff_by_file(diff)
+    selection = None
     if len(diff) <= DIFF_INLINE_CAP:
         kept, elided = chunks, []
         kind = "inlined"
     else:
-        kept, elided = pack_diff_chunks(chunks, DIFF_INLINE_CAP)
+        # Only over the cap: an under-cap review runs no extra engine and its footer is
+        # byte-identical to a pre-#35 one. The ranking is asked for BEFORE packing, since
+        # all it does is choose which files the packer sees first.
+        selection = select_files_to_inline(chunks, stat, conv_str, cdir)
+        kept, elided = pack_diff_chunks(apply_selection(chunks, selection.ranked),
+                                        DIFF_INLINE_CAP)
         # Nothing fit — a single file bigger than the whole cap. Degrade to the pre-#34
         # file-list-only block rather than emit half of one file's hunks: a truncated
         # diff is worse input than an honest omission, and the engine cannot tell the
@@ -780,6 +982,7 @@ def changed_files_block(cdir, merge_base, auth):
         total_files=len(chunks),
         inlined_chars=sum(len(t) for _, t in kept),
         total_chars=len(diff),
+        selection=selection,
     )
     # The measurement is logged BEFORE the empty-diff refusal below, not after: a 0-char
     # diff is exactly the case tools/finder_ab.py needs the number for, since `0 <= cap`
@@ -805,10 +1008,18 @@ def changed_files_block(cdir, merge_base, auth):
     listed = "\n".join(f"- `{path}`" for path, _ in elided)
     n_out = len(elided)
     plural = "s are" if n_out != 1 else " is"
+    # Say when the order is a triage pass's rather than the diff's own, so the finder
+    # does not read the sequence as git's. It is a hint about ordering and nothing more:
+    # the elided list below is still every remaining file, and the instruction to read
+    # them from the checkout is unchanged.
+    order = (
+        " (ordered by a cheap triage pass, most worth reading first)"
+        if mode.selected else ""
+    )
     return (
         f"{stat}\n\n(diff is large — {mode.inlined_files} of {mode.total_files} files "
-        f"are inlined in full below; the other {n_out} file{plural} listed after them, "
-        f"with no hunks. The repo is checked out at the PR head; run "
+        f"are inlined in full below{order}; the other {n_out} file{plural} listed after "
+        f"them, with no hunks. The repo is checked out at the PR head; run "
         f"`git diff {merge_base[:12]}..HEAD -- <file>` to read them.)\n"
         f"\n```diff\n{''.join(t for _, t in kept)}\n```\n"
         f"\nNot inlined ({n_out} file{'s' if n_out != 1 else ''}) — read from the "
@@ -1682,9 +1893,14 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd
-        diff_block, diff_mode, diff_stats = changed_files_block(cdir, merge_base, auth)
+        # Conventions are resolved BEFORE the diff block because the selection stage
+        # (issue #35) is told which files carry this repo's contracts — a doc it can rank
+        # accordingly rather than guess at.
         conv = convention_files(cdir)
         conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
+        diff_block, diff_mode, diff_stats = changed_files_block(
+            cdir, merge_base, auth, conv_str=conv_str
+        )
 
         gen_prompt = fill(
             REVIEW_PROMPT_FILE,

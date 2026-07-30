@@ -56,6 +56,11 @@ def fresh_review():
     review.AUDIT_PROMPT_FILE = os.path.join(REPO_ROOT, "audit-prompt.md")
     review.AUDIT_VERIFY_PROMPT_FILE = os.path.join(REPO_ROOT, "audit-verify-prompt.md")
     review.AUDIT_SYNTHESIS_PROMPT_FILE = os.path.join(REPO_ROOT, "audit-synthesis-prompt.md")
+    review.SELECT_PROMPT_FILE = os.path.join(REPO_ROOT, "select-prompt.md")
+    # Packing is this file's subject; the #35 selection stage that can REORDER the
+    # chunks is disabled so these assertions are about source-order packing alone.
+    # tests/test_diff_selection.py owns the ranked-order case.
+    review.SELECT_CMD = []
     return review
 
 
@@ -325,7 +330,8 @@ def test_journal_footer_and_calibration_agree():
 
         expected = (
             f"review-bot-review: diff {total} chars vs cap {total - 1} — "
-            f"3 of 4 files inlined, {sum(sizes[:3])} of {total} chars\n"
+            f"3 of 4 files inlined, {sum(sizes[:3])} of {total} chars "
+            f"(selection disabled)\n"
         )
         assert expected in err.getvalue(), err.getvalue()
         assert mode.footer_word == "partial 3/4 files", mode.footer_word
