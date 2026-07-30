@@ -702,6 +702,12 @@ class DiffMode:
             return "inlined"
         return "file-list only"
 
+    def __repr__(self):
+        return (
+            f"DiffMode({self.kind!r}, {self.inlined_files}/{self.total_files} files, "
+            f"{self.inlined_chars}/{self.total_chars} chars)"
+        )
+
 
 class Selection:
     """The cheap ranking stage's outcome (issue #35) — what WE chose to inline, which is
@@ -733,10 +739,7 @@ class Selection:
         return f"selection ranked {len(self.ranked)}: {listed}"
 
     def __repr__(self):
-        return (
-            f"DiffMode({self.kind!r}, {self.inlined_files}/{self.total_files} files, "
-            f"{self.inlined_chars}/{self.total_chars} chars)"
-        )
+        return f"Selection({self.status!r}, {len(self.ranked)} ranked)"
 
 
 def split_diff_by_file(diff):
@@ -857,16 +860,22 @@ def parse_selection(raw, known_paths):
     return ranked, reasons
 
 
-def select_files_to_inline(chunks, stat, conv_str, cwd):
+def select_files_to_inline(chunks, stat, conv_str, cwd, dry_run=False):
     """Ask the cheap engine which files deserve the inline budget. Returns a `Selection`.
 
     Every failure path degrades to an empty ranking (source order), never to a dead
     review: the finder's own pass is what produces findings, and losing a *hint* is not
     worth losing a review. The stage is invoked directly rather than through run_engine
     because run_engine dies on a non-zero exit — correct for the finder, wrong here.
+
+    `dry_run` is the caller's promise that NO engine runs. This stage is an engine like
+    any other, so it degrades here too — the guard sits above the subprocess rather than
+    at the call site so no future caller can reach the engine without passing it.
     """
     if not SELECT_CMD:
         return Selection("disabled")
+    if dry_run:
+        return Selection("disabled", detail="dry run")
     known = [path for path, _ in chunks]
     try:
         prompt = fill(
@@ -929,7 +938,7 @@ def apply_selection(chunks, ranked):
     return first + rest
 
 
-def changed_files_block(cdir, merge_base, auth, conv_str="(none found)"):
+def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run=False):
     """Return (block, mode, stats) — the review prompt's diff input, the `DiffMode`
     saying how much of the diff that block actually carries, and the diff's size
     ({"files": N, "insertions": A, "deletions": D}) for the empty-verdict calibration.
@@ -944,6 +953,10 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)"):
     packed diff still cannot hold everything, a cheap engine ranks the files first
     (issue #35) so the budget goes to the hunks most worth reading — ORDER only: the
     packer still decides what fits, and an unranked file is listed exactly as before.
+
+    `dry_run` suppresses that ranking engine, keeping this function pure git so a dry
+    run really does execute nothing (README's `dry_run` contract). The block then packs
+    in source order, exactly as it does when the stage is disabled or fails.
     """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
@@ -968,7 +981,7 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)"):
         # Only over the cap: an under-cap review runs no extra engine and its footer is
         # byte-identical to a pre-#35 one. The ranking is asked for BEFORE packing, since
         # all it does is choose which files the packer sees first.
-        selection = select_files_to_inline(chunks, stat, conv_str, cdir)
+        selection = select_files_to_inline(chunks, stat, conv_str, cdir, dry_run=dry_run)
         kept, elided = pack_diff_chunks(apply_selection(chunks, selection.ranked),
                                         DIFF_INLINE_CAP)
         # Nothing fit — a single file bigger than the whole cap. Degrade to the pre-#34
@@ -1899,7 +1912,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
         conv = convention_files(cdir)
         conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
         diff_block, diff_mode, diff_stats = changed_files_block(
-            cdir, merge_base, auth, conv_str=conv_str
+            cdir, merge_base, auth, conv_str=conv_str, dry_run=args.dry_run
         )
 
         gen_prompt = fill(

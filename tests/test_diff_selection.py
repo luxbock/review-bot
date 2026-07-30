@@ -313,6 +313,52 @@ def test_apply_selection_is_a_permutation():
     print("ok  6. apply_selection permutes the chunk list and nothing more")
 
 
+# ── 7. a dry run executes no engine, including this one ─────────────────────
+def test_dry_run_never_selects():
+    """`--dry-run` promises the journal that no engine ran. The ranking stage is an
+    engine, and it fires during prompt construction — before the dry-run branch that
+    prints that promise — so only an explicit flag can keep the claim true."""
+    with scratch_dir() as tmp:
+        review = fresh_review()
+        cmd, prompt_log = make_select_stub(tmp, stdout=envelope([{"path": "file2.txt"}]))
+        review.SELECT_CMD = cmd.split()
+        wt, base = make_tree(tmp, [500, 500, 500])
+        chunks = review.split_diff_by_file(_git(wt, "diff", f"{base}..HEAD"))
+        sizes = {p: len(t) for p, t in chunks}
+        review.DIFF_INLINE_CAP = sizes["file0.txt"] + sizes["file2.txt"]
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _block, mode, _stats = review.changed_files_block(
+                wt, base, _Auth(), dry_run=True
+            )
+
+        # The engine was never spawned, and the journal says why rather than going quiet.
+        assert not os.path.exists(prompt_log), "a dry run must not invoke the cheap engine"
+        assert "selecting inline order" not in err.getvalue(), err.getvalue()
+        assert mode.selection.status == "disabled", vars(mode.selection)
+        assert mode.selection.detail == "dry run", vars(mode.selection)
+        assert "selection disabled: dry run" in err.getvalue(), err.getvalue()
+        # Packing still happened — the diff degrades to source order, never to nothing.
+        assert (mode.kind, mode.inlined_files, mode.total_files) == ("partial", 2, 3), mode
+        assert not mode.selected and mode.footer_word == "partial 2/3 files", mode.footer_word
+    print("ok  7. a dry run runs no selection engine and says so in the journal")
+
+
+# ── 8. each class reprs its own state ────────────────────────────────────────
+def test_reprs_belong_to_their_classes():
+    """Both types are printed by bare `assert …, mode` / `, selection` failures across
+    these suites; a repr on the wrong class turns a diagnostic into an address or a
+    crash."""
+    review = fresh_review()
+    mode = review.DiffMode("partial", inlined_files=2, total_files=3,
+                           inlined_chars=10, total_chars=99)
+    assert repr(mode) == "DiffMode('partial', 2/3 files, 10/99 chars)", repr(mode)
+    selection = review.Selection("ok", ranked=["a.py", "b.py"])
+    assert repr(selection) == "Selection('ok', 2 ranked)", repr(selection)
+    print("ok  8. DiffMode and Selection each carry their own __repr__")
+
+
 TESTS = [
     test_under_cap_never_selects,
     test_ranking_decides_what_is_inlined,
@@ -320,6 +366,8 @@ TESTS = [
     test_footer_and_journal_agree,
     test_parser_rejects_hostile_input,
     test_apply_selection_is_a_permutation,
+    test_dry_run_never_selects,
+    test_reprs_belong_to_their_classes,
 ]
 
 
