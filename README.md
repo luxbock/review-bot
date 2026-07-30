@@ -74,6 +74,14 @@ and past either smallness bound (`REVIEW_BOT_SMALL_DIFF_MAX_FILES`, default 5;
 
 > ⚠️ 0 findings on a substantial change (14 files, +610/-230) — empty results are weaker evidence at this size. Treat as not fully reviewed; a second pass can be requested with `@review-bot` or `review-bot-review`.
 
+Size is only half the question; the other half is how much of that size the
+finder was actually shown (see *Diff input mode*). An empty result on hunks that
+were never in the prompt is not evidence about them at **any** size, so the
+input mode is checked before the smallness bounds — a three-file change reviewed
+from a file list gets the warning, not the reassurance:
+
+> ⚠️ 0 findings on a change the finder did not fully see (3 files, +1125/-47, diff `file-list`) — hunks that were never shown cannot be evidence of clean code, whatever the size. Treat as not fully reviewed; a second pass can be requested with `@review-bot` or `review-bot-review`.
+
 The raw numbers always render so a consuming agent can apply its own judgment.
 The tiers only reword the disclosure — a tier change can never add findings, and
 neither tier re-rolls the finder. The size comes from the same
@@ -206,21 +214,40 @@ order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
 
 ## Diff input mode
 
-A PR review feeds the finder either the **full diff** or, when the diff exceeds
-`REVIEW_BOT_DIFF_CAP` (default 60000 chars), only the **file list** plus the
-instruction to read the checked-out tree. Which one the finder got changes what
-it can find, so both are now disclosed rather than inferred:
+A PR review feeds the finder as much of the diff as `REVIEW_BOT_DIFF_CAP`
+(default 60000 chars) allows, packed **whole file by whole file** in the diff's
+own order: each file's hunks go in if they fit in the remaining budget, and a
+file that does not fit is skipped — later, smaller files still get their chance.
+That yields three input modes, and how much the finder was shown changes what it
+can find, so the mode is disclosed rather than inferred:
+
+| mode | what the prompt carries |
+| --- | --- |
+| `inlined` | every file's hunks |
+| `partial k/n files` | k whole files' hunks, plus the names of the other n−k |
+| `file-list` | no hunks at all — `git diff --stat` and the instruction to read the checkout |
 
 - a journal line, emitted before any engine runs —
-  `review-bot-review: diff 65525 chars vs cap 60000 — file-list only`
-  (the alternative wording is `— inlined`);
+  `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars`
+  (the other two wordings are `— inlined` and `— file-list only`);
 - a review footer segment directly after `findings` and before `merge-base`:
-  ``diff `inlined` `` or ``diff `file-list` ``.
+  ``diff `inlined` ``, ``diff `partial 3/9 files` `` or ``diff `file-list` ``.
 
-Both come from the single `len(diff) <= REVIEW_BOT_DIFF_CAP` comparison
-`changed_files_block` already made — a diff of exactly the cap is inlined — so
-the disclosure can never drift from the input the engine actually saw. PR mode
-only: triage and audit footers are unchanged.
+Whole files only: a half-diff is worse input than an honest omission, and the
+engine cannot tell the two apart unless it is told. When not even one file fits
+(a single file larger than the whole cap), the review degrades to `file-list`
+rather than emit a truncated file. The cap governs diff *content*; the `--stat`
+header and the surrounding prose are not counted against it.
+
+All three disclosures come from the one `DiffMode` `changed_files_block` returns
+after packing — a diff of exactly the cap is still fully inlined — so the
+disclosure can never drift from the input the engine actually saw. PR mode only:
+triage and audit footers are unchanged.
+
+Before #34 the cap was all-or-nothing, so a diff 2% over it lost 100% of its
+hunks: `olli/org-gtd-cli#52` was reviewed twice that way, at 61,313 and 64,704
+chars against a 60,000 cap, the second returning a zero-finding ✅ on a
+three-file change the finder had never been shown.
 
 ### The A/B harness
 
@@ -234,7 +261,10 @@ python3 tools/finder_ab.py --owner O --repo R --pr N [--runs 5] [--out finder-ab
 ```
 
 The input mode is forced through the shipped knob and nothing else:
-`REVIEW_BOT_DIFF_CAP=100000000` (nothing elides) versus `=1` (everything does).
+`REVIEW_BOT_DIFF_CAP=100000000` (nothing elides) versus `=1` (everything does —
+at a cap of 1 no file can be packed whole, so the elide arm still reaches the
+`file-list` mode rather than a `partial` one, and the two arms stay the extremes
+they were before #34).
 It **never posts** — every invocation carries `--print-only` — and it drives
 `review-bot-review-local`, not the `review-bot-review` socket client, because
 the client cannot carry the cap (`review-bot-serve` whitelists request fields

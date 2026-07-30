@@ -2,8 +2,10 @@
 """Acceptance tests for the diff input-mode instrumentation (issue #21).
 
 Covers, with NO live engine and NO live forge:
-  * the inline/file-list cap boundary, tested EXACTLY (a diff of precisely
-    DIFF_INLINE_CAP chars inlines; one char more does not);
+  * the inline cap boundary, tested EXACTLY (a diff of precisely
+    DIFF_INLINE_CAP chars inlines; one char more does not — on the ONE-file
+    fixture used here, which is the file-list fallback both before and after
+    issue #34's packing; tests/test_diff_packing.py owns the multi-file case);
   * the journal line `diff <N> chars vs cap <C> — <inlined|file-list only>`;
   * the rendered footer segment `diff `inlined|file-list`` and its position
     (after `findings`, before `merge-base`);
@@ -256,15 +258,18 @@ def test_cap_boundary_is_exact():
         assert diff_len(wt, base) == cap
 
         with contextlib.redirect_stderr(io.StringIO()):
-            block, inlined, _stats = review.changed_files_block(wt, base, _Auth())
-        assert inlined is True, "a diff of exactly DIFF_INLINE_CAP chars must inline"
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+        assert mode.kind == "inlined", "a diff of exactly DIFF_INLINE_CAP chars must inline"
         assert "```diff" in block and "diff is large" not in block
 
         set_payload(wt, n + 1)
         assert diff_len(wt, base) == cap + 1
         with contextlib.redirect_stderr(io.StringIO()):
-            block, inlined, _stats = review.changed_files_block(wt, base, _Auth())
-        assert inlined is False, "one char over the cap must fall back to the file list"
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+        # ONE file, one char over the cap: nothing can be packed whole, so this is still
+        # the file-list fallback after #34 (its constraint 4). The multi-file case — the
+        # one #34 changes — is tests/test_diff_packing.py's subject.
+        assert mode.kind == "file-list", "one char over the cap must fall back to the file list"
         assert "```diff" not in block and "diff is large" in block
     print("ok  1. cap boundary: exactly DIFF_INLINE_CAP inlines, +1 char elides")
 

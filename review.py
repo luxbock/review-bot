@@ -616,15 +616,138 @@ def prepare_checkout(
     return co, merge_base
 
 
+class DiffMode:
+    """What the finder was actually shown of the diff — measured once, in
+    `changed_files_block`, and carried to every consumer (issue #21's invariant).
+
+    Three states, because since issue #34 the cap is packed per file rather than
+    applied all-or-nothing:
+
+      `inlined`    — every file's hunks are in the prompt;
+      `partial`    — some whole files are in the prompt, the rest are named only;
+      `file-list`  — no hunks at all, only `git diff --stat` and an instruction.
+
+    Never re-derive any of these from a diff length downstream: the journal line, the
+    footer segment and the empty-verdict calibration must all be the same measurement,
+    or the disclosure can drift from the input the engine really got.
+    """
+
+    def __init__(self, kind, inlined_files, total_files, inlined_chars, total_chars):
+        self.kind = kind
+        self.inlined_files = inlined_files
+        self.total_files = total_files
+        self.inlined_chars = inlined_chars
+        self.total_chars = total_chars
+
+    @property
+    def fully_inlined(self):
+        return self.kind == "inlined"
+
+    @property
+    def footer_word(self):
+        """The footer's ``diff `…` `` segment. Byte-identical to the pre-#34 wording in
+        the two states that existed then, so old and new footers stay comparable."""
+        if self.kind == "partial":
+            return f"partial {self.inlined_files}/{self.total_files} files"
+        return self.kind
+
+    @property
+    def journal_phrase(self):
+        """The tail of the journal line. tools/finder_ab.py keys off the leading
+        `diff <N> chars vs cap <C> — ` prefix only, so this wording is free to grow."""
+        if self.kind == "partial":
+            return (
+                f"{self.inlined_files} of {self.total_files} files inlined, "
+                f"{self.inlined_chars} of {self.total_chars} chars"
+            )
+        if self.kind == "inlined":
+            return "inlined"
+        return "file-list only"
+
+    def __repr__(self):
+        return (
+            f"DiffMode({self.kind!r}, {self.inlined_files}/{self.total_files} files, "
+            f"{self.inlined_chars}/{self.total_chars} chars)"
+        )
+
+
+def split_diff_by_file(diff):
+    """Split a unified diff into whole per-file chunks, in source order.
+
+    Returns [(path, text), …] where the texts concatenate back to `diff`. A file header
+    is the only thing that can start a line with `diff --git ` at column 0 — every line
+    inside a hunk carries a ` `/`+`/`-` prefix — so splitting there cannot cut a hunk in
+    half. Anything before the first header (there is normally nothing) is kept as a
+    leading chunk so the round-trip holds.
+    """
+    chunks = []
+    current = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current:
+            chunks.append("".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append("".join(current))
+    return [(diff_chunk_path(c), c) for c in chunks]
+
+
+def diff_chunk_path(chunk):
+    """Best-effort path for one file chunk, for the not-inlined list.
+
+    Advisory only: `git diff --stat` above the block is the authoritative file list, so a
+    path this cannot parse degrades to a `?` entry rather than to a wrong claim.
+    """
+    for line in chunk.splitlines():
+        # `+++ b/path` is absent for a deletion (`+++ /dev/null`), where `--- a/path` is
+        # the surviving name; both are absent for a pure mode/rename change.
+        if line.startswith("+++ b/"):
+            return line[6:].strip()
+        if line.startswith("--- a/") and "+++ /dev/null" in chunk:
+            return line[6:].strip()
+        if line.startswith("rename to "):
+            return line[len("rename to "):].strip()
+    head = chunk.splitlines()[0] if chunk else ""
+    if head.startswith("diff --git a/") and " b/" in head:
+        return head[len("diff --git a/"):].rsplit(" b/", 1)[0].strip()
+    return "?"
+
+
+def pack_diff_chunks(chunks, cap):
+    """Greedy first-fit in source order: return (kept, elided).
+
+    Source order rather than largest- or smallest-first so the inlined hunks read in the
+    same order as `--stat` above them, and so the packing is a pure function of the diff
+    (no size-dependent reshuffling between two reviews of the same PR). A file that does
+    not fit is skipped, not a stop condition — the files after it still get their chance
+    at the remaining budget.
+
+    The cap governs diff CONTENT only, exactly as the pre-#34 `len(diff) <= cap`
+    comparison did; the `--stat` header and the surrounding prose are not counted.
+    """
+    kept, elided, budget = [], [], cap
+    for path, text in chunks:
+        if len(text) <= budget:
+            kept.append((path, text))
+            budget -= len(text)
+        else:
+            elided.append((path, text))
+    return kept, elided
+
+
 def changed_files_block(cdir, merge_base, auth):
-    """Return (block, inlined, stats) — the review prompt's diff input, the flag saying
-    whether the FULL diff was inlined or only the file list was, and the diff's size
+    """Return (block, mode, stats) — the review prompt's diff input, the `DiffMode`
+    saying how much of the diff that block actually carries, and the diff's size
     ({"files": N, "insertions": A, "deletions": D}) for the empty-verdict calibration.
 
-    The flag and the stats are returned rather than re-derived by the caller on purpose
+    The mode and the stats are returned rather than re-derived by the caller on purpose
     (issue #21): each measurement exists in exactly one place, so the journal line, the
     review footer and the disclosure can never disagree with the input the engine
     actually saw.
+
+    Over-cap diffs are packed per whole file (issue #34) instead of collapsing to the
+    file list entirely: a diff 2% over the cap used to lose 100% of its hunks.
     """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
@@ -640,26 +763,57 @@ def changed_files_block(cdir, merge_base, auth):
         insertions += int(parts[0]) if parts[0].isdigit() else 0
         deletions += int(parts[1]) if parts[1].isdigit() else 0
     stats = {"files": files, "insertions": insertions, "deletions": deletions}
-    inlined = len(diff) <= DIFF_INLINE_CAP
+    chunks = split_diff_by_file(diff)
+    if len(diff) <= DIFF_INLINE_CAP:
+        kept, elided = chunks, []
+        kind = "inlined"
+    else:
+        kept, elided = pack_diff_chunks(chunks, DIFF_INLINE_CAP)
+        # Nothing fit — a single file bigger than the whole cap. Degrade to the pre-#34
+        # file-list-only block rather than emit half of one file's hunks: a truncated
+        # diff is worse input than an honest omission, and the engine cannot tell the
+        # two apart unless it is told.
+        kind = "partial" if kept else "file-list"
+    mode = DiffMode(
+        kind,
+        inlined_files=len(kept),
+        total_files=len(chunks),
+        inlined_chars=sum(len(t) for _, t in kept),
+        total_chars=len(diff),
+    )
     # The measurement is logged BEFORE the empty-diff refusal below, not after: a 0-char
     # diff is exactly the case tools/finder_ab.py needs the number for, since `0 <= cap`
     # holds under ANY cap and the inlined/file-list word alone cannot tell "the cap did
     # not take" from "there was nothing to review". Dying first would leave the harness
     # with no measurement at all. Nothing is rendered and no engine runs either way.
-    log(f"diff {len(diff)} chars vs cap {DIFF_INLINE_CAP} — "
-        f"{'inlined' if inlined else 'file-list only'}")
+    log(f"diff {len(diff)} chars vs cap {DIFF_INLINE_CAP} — {mode.journal_phrase}")
     if not diff:
         die(
             f"empty diff at merge base {merge_base[:12]} — nothing to review; "
             "refusing to render a vacuous pass"
         )
-    if inlined:
-        return f"{stat}\n```diff\n{diff}\n```", True, stats
+    if mode.fully_inlined:
+        return f"{stat}\n```diff\n{diff}\n```", mode, stats
+    if kind == "file-list":
+        return (
+            f"{stat}\n\n(diff is large — only the file list is inlined. The repo is "
+            f"checked out at the PR head; run `git diff {merge_base[:12]}..HEAD -- "
+            f"<file>` to inspect specific hunks.)",
+            mode,
+            stats,
+        )
+    listed = "\n".join(f"- `{path}`" for path, _ in elided)
+    n_out = len(elided)
+    plural = "s are" if n_out != 1 else " is"
     return (
-        f"{stat}\n\n(diff is large — only the file list is inlined. The repo is checked "
-        f"out at the PR head; run `git diff {merge_base[:12]}..HEAD -- <file>` to inspect "
-        f"specific hunks.)",
-        False,
+        f"{stat}\n\n(diff is large — {mode.inlined_files} of {mode.total_files} files "
+        f"are inlined in full below; the other {n_out} file{plural} listed after them, "
+        f"with no hunks. The repo is checked out at the PR head; run "
+        f"`git diff {merge_base[:12]}..HEAD -- <file>` to read them.)\n"
+        f"\n```diff\n{''.join(t for _, t in kept)}\n```\n"
+        f"\nNot inlined ({n_out} file{'s' if n_out != 1 else ''}) — read from the "
+        f"checkout before judging:\n{listed}",
+        mode,
         stats,
     )
 
@@ -1214,7 +1368,7 @@ def provenance_counts(provenance):
     return counts
 
 
-def append_clean_review_provenance(out, provenance, diff_stats=None):
+def append_clean_review_provenance(out, provenance, diff_stats=None, diff_mode=None):
     stages = provenance.get("stages", []) if provenance else []
     if not stages:
         return
@@ -1224,7 +1378,21 @@ def append_clean_review_provenance(out, provenance, diff_stats=None):
             n = diff_stats["files"]
             plus, minus = diff_stats["insertions"], diff_stats["deletions"]
             size = f"{n} file{'s' if n != 1 else ''}, +{plus}/-{minus}"
-            if n <= SMALL_DIFF_MAX_FILES and plus + minus <= SMALL_DIFF_MAX_LINES:
+            # Size is only half the question; the other half is how much of that size the
+            # finder was shown (issue #34, constraint 5). An empty result on hunks that
+            # were never in the prompt is not evidence about them at ANY size, so the
+            # input mode is checked before the smallness tiers — a 3-file change reviewed
+            # from a file list must not read as "typical and consistent with a clean PR".
+            if diff_mode is not None and not diff_mode.fully_inlined:
+                out += [
+                    f"⚠️ 0 findings on a change the finder did not fully see ({size}, "
+                    f"diff `{diff_mode.footer_word}`) — hunks that were never shown "
+                    "cannot be evidence of clean code, whatever the size. Treat as not "
+                    "fully reviewed; a second pass can be requested with `@review-bot` "
+                    "or `review-bot-review`.",
+                    "",
+                ]
+            elif n <= SMALL_DIFF_MAX_FILES and plus + minus <= SMALL_DIFF_MAX_LINES:
                 out += [
                     f"0 findings on a small change ({size}) — an empty result is "
                     "typical and consistent with a clean PR. Verification skipped: "
@@ -1254,7 +1422,7 @@ def append_clean_review_provenance(out, provenance, diff_stats=None):
         ]
 
 
-def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, diff_inlined=None,
+def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, diff_mode=None,
                     diff_stats=None, head_sha=None):
     verdict = review["verdict"]
     findings = review["findings"]
@@ -1264,7 +1432,7 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, 
         out += [review["summary"], ""]
     if not findings:
         out += [f"No blocking issues found at or above the **{bar}** confidence bar.", ""]
-        append_clean_review_provenance(out, provenance, diff_stats)
+        append_clean_review_provenance(out, provenance, diff_stats, diff_mode)
     else:
         out += [f"### Findings ({len(findings)})", ""]
         for f in findings:
@@ -1281,12 +1449,13 @@ def render_markdown(review, harnesses, depth, bar, merge_base, provenance=None, 
     hlabel = ",".join(harnesses)
     counts = provenance_counts(provenance)
     findings_segment = f" · findings `{counts}`" if counts else ""
-    # diff_inlined comes straight from changed_files_block's own comparison (issue #21),
-    # so the disclosed input mode is the one the finder actually got. None (no caller
-    # information, e.g. a direct render in a test) simply omits the segment.
+    # diff_mode comes straight from changed_files_block's own packing (issues #21, #34),
+    # so the disclosed input mode is the one the finder actually got — three states now,
+    # never collapsed to two. None (no caller information, e.g. a direct render in a
+    # test) simply omits the segment.
     diff_segment = ""
-    if diff_inlined is not None:
-        diff_segment = f" · diff `{'inlined' if diff_inlined else 'file-list'}`"
+    if diff_mode is not None:
+        diff_segment = f" · diff `{diff_mode.footer_word}`"
     # head_sha stamps the reviewed head into the footer so poll.py can attribute this
     # review to a revision (per-revision round cap, issue #29). None (no caller
     # information, e.g. a direct render in a test) simply omits the segment.
@@ -1513,7 +1682,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
     )
     with checkout:
         cdir = checkout.wt  # the private per-run worktree — the engine's cwd
-        diff_block, diff_inlined, diff_stats = changed_files_block(cdir, merge_base, auth)
+        diff_block, diff_mode, diff_stats = changed_files_block(cdir, merge_base, auth)
         conv = convention_files(cdir)
         conv_str = ", ".join(conv) if conv else "(none found — infer conventions from the surrounding code)"
 
@@ -1552,7 +1721,7 @@ def do_pr_review(args, harnesses, bar, focus, token, auth):
         )
         markdown = render_markdown(
             final, harnesses, args.depth, bar, merge_base, provenance=provenance,
-            diff_inlined=diff_inlined, diff_stats=diff_stats, head_sha=expected_head,
+            diff_mode=diff_mode, diff_stats=diff_stats, head_sha=expected_head,
         )
         return post_or_print(args, token, markdown, "review")
 
