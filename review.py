@@ -803,14 +803,16 @@ def changed_files_block(cdir, merge_base, auth):
             stats,
         )
     listed = "\n".join(f"- `{path}`" for path, _ in elided)
+    n_out = len(elided)
+    plural = "s are" if n_out != 1 else " is"
     return (
         f"{stat}\n\n(diff is large — {mode.inlined_files} of {mode.total_files} files "
-        f"are inlined in full below; the other {len(elided)} are listed after them, with "
-        f"no hunks. The repo is checked out at the PR head; run "
-        f"`git diff {merge_base[:12]}..HEAD -- <file>` to read any of those.)\n"
+        f"are inlined in full below; the other {n_out} file{plural} listed after them, "
+        f"with no hunks. The repo is checked out at the PR head; run "
+        f"`git diff {merge_base[:12]}..HEAD -- <file>` to read them.)\n"
         f"\n```diff\n{''.join(t for _, t in kept)}\n```\n"
-        f"\nNot inlined ({len(elided)} file(s)) — read these from the checkout before "
-        f"judging them:\n{listed}",
+        f"\nNot inlined ({n_out} file{'s' if n_out != 1 else ''}) — read from the "
+        f"checkout before judging:\n{listed}",
         mode,
         stats,
     )

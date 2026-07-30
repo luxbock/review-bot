@@ -265,7 +265,8 @@ def test_boundary_unchanged_and_over_cap_packs():
         assert mode.inlined_chars == sum(sizes[:3]) and mode.total_chars == total, mode
         assert "```diff" in block, block[:400]
         assert "+" + "x" * 800 in block, "the first file's hunk must be inlined in full"
-        assert "Not inlined (1 file(s))" in block and "- `file3.txt`" in block, block[-400:]
+        assert "Not inlined (1 file)" in block and "- `file3.txt`" in block, block[-400:]
+        assert "the other 1 file is listed after them" in block, block[:500]
         assert "- `file0.txt`" not in block, "an inlined file must not also be listed"
     print("ok  2. exactly-cap still inlines everything; over-cap keeps the files that fit")
 
@@ -283,6 +284,7 @@ def test_oversized_file_is_skipped_not_truncated():
             block, mode, _stats = review.changed_files_block(wt, base, _Auth())
 
         assert (mode.kind, mode.inlined_files, mode.total_files) == ("partial", 2, 3), mode
+        assert "Not inlined (1 file)" in block, block[-300:]
         assert "- `file1.txt`" in block and "x" * 5000 not in block, "no partial file"
         assert "file0.txt" in block and "file2.txt" in block
         # Nothing may be truncated mid-file: every inlined chunk appears verbatim.
