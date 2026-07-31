@@ -506,18 +506,26 @@ def test_handles_renames_deletions_modes_binaries_and_odd_names():
     print("ok 10. renames, deletions, mode changes, binaries and odd names all parse")
 
 
-# ── 11. git text output containing bytes outside UTF-8 ───────────────────────
+# ── 11-13. git text output containing bytes outside UTF-8 ────────────────────
+def make_undecodable_tree(parent, include_source=True):
+    wt = os.path.join(parent, "undecodable-worktree")
+    os.makedirs(wt)
+    subprocess.run([GIT, "init", "-q", wt], check=True)
+    _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
+    base = _git(wt, "rev-parse", "HEAD").strip()
+    if include_source:
+        with open(os.path.join(wt, "ordinary.py"), "w") as f:
+            f.write("print('readable')\n")
+    with open(os.path.join(wt, "examples.db"), "wb") as f:
+        f.write(b"caf\xe9 latin-1 line\n" * 40)
+    _git(wt, "add", ".")
+    _git(wt, *GIT_ID, "commit", "-qm", "add NUL-free non-UTF-8 file")
+    return wt, base
+
+
 def test_git_replaces_undecodable_diff_bytes():
     with scratch_dir() as tmp:
-        wt = os.path.join(tmp, "undecodable-worktree")
-        os.makedirs(wt)
-        subprocess.run([GIT, "init", "-q", wt], check=True)
-        _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
-        base = _git(wt, "rev-parse", "HEAD").strip()
-        with open(os.path.join(wt, "examples.db"), "wb") as f:
-            f.write(b"caf\xe9 latin-1 line\n" * 40)
-        _git(wt, "add", "examples.db")
-        _git(wt, *GIT_ID, "commit", "-qm", "add NUL-free non-UTF-8 file")
+        wt, base = make_undecodable_tree(tmp, include_source=False)
 
         raw_diff = subprocess.run(
             [GIT, "-C", wt, "diff", f"{base}..HEAD"],
@@ -556,6 +564,68 @@ def test_engines_replace_undecodable_output_bytes():
     print("ok 12. finder and selection engines replace undecodable output bytes")
 
 
+def test_undecodable_chunks_are_disclosed_but_never_inlined():
+    with scratch_dir() as tmp:
+        wt, base = make_undecodable_tree(tmp)
+        trap = os.path.join(tmp, "selection-must-not-run.py")
+        marker = os.path.join(tmp, "selection-ran")
+        with open(trap, "w") as f:
+            f.write("#!" + sys.executable + "\n")
+            f.write("from pathlib import Path\n")
+            f.write(f"Path({marker!r}).write_text('called')\n")
+        os.chmod(trap, os.stat(trap).st_mode | stat.S_IEXEC | stat.S_IRWXU)
+
+        review = fresh_review()
+        review.SELECT_CMD = [trap]
+        review.DIFF_INLINE_CAP = 100000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+
+        assert not os.path.exists(marker), "an under-cap diff must not invoke selection"
+        assert mode.kind == "partial" and mode.undecodable_files == 1, mode
+        assert (mode.inlined_files, mode.total_files) == (1, 2), mode
+        assert mode.footer_word == "partial 1/2 files, 1 undecodable", mode.footer_word
+        expected_journal = (
+            f"1 of 2 files inlined, {mode.inlined_chars} of {mode.total_chars} chars, "
+            "1 not valid UTF-8 (selection disabled: under cap)"
+        )
+        assert mode.journal_phrase == expected_journal, mode.journal_phrase
+        assert "ordinary.py" in block and "print('readable')" in block, block
+        assert "�" not in block, "replacement-character diff content must not be inlined"
+        assert (
+            "- `examples.db` (not valid UTF-8 — not readable as text)" in block
+        ), block
+        assert "some files are not valid UTF-8" in block, block
+        assert expected_journal in err.getvalue(), err.getvalue()
+
+        selected = review.DiffMode(
+            "partial", 1, 2, mode.inlined_chars, mode.total_chars,
+            selection=review.Selection("ok", ranked=["ordinary.py"]),
+            undecodable_files=1,
+        )
+        assert selected.footer_word == "partial 1/2 files, selected, 1 undecodable"
+        assert selected.journal_phrase.endswith(
+            ", 1 not valid UTF-8 (selection ranked 1: ordinary.py)"
+        ), selected.journal_phrase
+
+    with scratch_dir() as tmp:
+        wt, base = make_undecodable_tree(tmp, include_source=False)
+        review = fresh_review()
+        review.DIFF_INLINE_CAP = 100000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+        assert mode.kind == "file-list" and mode.inlined_files == 0, mode
+        assert mode.footer_word == "file-list, 1 undecodable", mode.footer_word
+        assert mode.journal_phrase == "file-list only, 1 not valid UTF-8"
+        assert "```diff" not in block and "�" not in block, block
+        assert "diff is not valid UTF-8" in block, block
+        assert "- `examples.db` (not valid UTF-8 — not readable as text)" in block
+        assert "file-list only, 1 not valid UTF-8" in err.getvalue(), err.getvalue()
+    print("ok 13. undecodable chunks are marked and excluded, including all-undecodable input")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -569,6 +639,7 @@ TESTS = [
     test_handles_renames_deletions_modes_binaries_and_odd_names,
     test_git_replaces_undecodable_diff_bytes,
     test_engines_replace_undecodable_output_bytes,
+    test_undecodable_chunks_are_disclosed_but_never_inlined,
 ]
 
 
