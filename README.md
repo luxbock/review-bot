@@ -296,7 +296,7 @@ The ranking decides **order, never scope**:
 - the reply is untrusted data: a path that is not in this diff is discarded, a
   duplicate collapses, a reason is flattened to one clipped line, and nothing
   else in the object is read. There is no path by which a ranking becomes a
-finding.
+  finding.
 
 An under-cap diff never runs this engine. If an undecodable file makes such a diff
 `partial`, the journal's required selection suffix records
