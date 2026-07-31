@@ -43,9 +43,9 @@ def load_module(name, path):
     return mod
 
 
-def fresh_review():
+def fresh_review(path=None, name="review_diff_packing_test"):
     """review.py wired past its build-time @PLACEHOLDER@s so it runs from the checkout."""
-    review = load_module("review_diff_packing_test", os.path.join(REPO_ROOT, "review.py"))
+    review = load_module(name, path or os.path.join(REPO_ROOT, "review.py"))
     review.GIT = GIT
     review.REVIEW_PROMPT_FILE = os.path.join(REPO_ROOT, "review-prompt.md")
     review.VERIFY_PROMPT_FILE = os.path.join(REPO_ROOT, "verify-prompt.md")
@@ -506,7 +506,7 @@ def test_handles_renames_deletions_modes_binaries_and_odd_names():
     print("ok 10. renames, deletions, mode changes, binaries and odd names all parse")
 
 
-# ── 11-13. git text output containing bytes outside UTF-8 ────────────────────
+# ── 11-14. git text output and compatibility across undecodable handling ─────
 def make_undecodable_tree(parent, include_source=True):
     wt = os.path.join(parent, "undecodable-worktree")
     os.makedirs(wt)
@@ -520,19 +520,17 @@ def make_undecodable_tree(parent, include_source=True):
         f.write(b"caf\xe9 latin-1 line\n" * 40)
     _git(wt, "add", ".")
     _git(wt, *GIT_ID, "commit", "-qm", "add NUL-free non-UTF-8 file")
+    raw_diff = subprocess.run(
+        [GIT, "-C", wt, "diff", f"{base}..HEAD"], check=True, capture_output=True,
+    ).stdout
+    assert b"Binary files" not in raw_diff, "fixture must exercise git's text diff path"
+    assert b"\xe9" in raw_diff, "fixture must carry the undecodable byte into git output"
     return wt, base
 
 
 def test_git_replaces_undecodable_diff_bytes():
     with scratch_dir() as tmp:
         wt, base = make_undecodable_tree(tmp, include_source=False)
-
-        raw_diff = subprocess.run(
-            [GIT, "-C", wt, "diff", f"{base}..HEAD"],
-            check=True, capture_output=True,
-        ).stdout
-        assert b"Binary files" not in raw_diff, "fixture must exercise git's text diff path"
-        assert b"\xe9" in raw_diff, "fixture must carry the undecodable byte into git output"
 
         review = fresh_review()
         proc = review.git(["diff", f"{base}..HEAD"], cwd=wt, auth=_Auth())
@@ -626,6 +624,46 @@ def test_undecodable_chunks_are_disclosed_but_never_inlined():
     print("ok 13. undecodable chunks are marked and excluded, including all-undecodable input")
 
 
+def test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte():
+    with scratch_dir() as tmp:
+        baseline_path = os.path.join(tmp, "review-f3f7611.py")
+        baseline_source = _git(REPO_ROOT, "show", "f3f7611:review.py")
+        with open(baseline_path, "w") as f:
+            f.write(baseline_source)
+        baseline = fresh_review(baseline_path, "review_diff_packing_baseline")
+        current = fresh_review(name="review_diff_packing_current")
+
+        wt, base = make_multi_file_tree(tmp, [800, 300, 800, 300])
+        total = len(diff_text(wt, base))
+        selector = os.path.join(tmp, "selector.py")
+        with open(selector, "w") as f:
+            f.write("import json, sys\n")
+            f.write("sys.stdin.read()\n")
+            f.write("print(json.dumps({'files': ['file3.txt', 'file2.txt', "
+                    "'file1.txt', 'file0.txt']}))\n")
+
+        cases = [
+            ("inlined", total, [], False),
+            ("partial", total - 1, [], False),
+            ("partial selected", total - 1, [sys.executable, selector], True),
+            ("file-list", 1, [], False),
+        ]
+        for label, cap, select_cmd, expect_selected in cases:
+            observed = []
+            for review in (baseline, current):
+                review.DIFF_INLINE_CAP = cap
+                review.SELECT_CMD = list(select_cmd)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+                observed.append((block, mode.footer_word, mode.journal_phrase))
+                assert mode.selected is expect_selected, (label, mode)
+            assert observed[1] == observed[0], (
+                f"{label} output changed from f3f7611:\n"
+                f"baseline={observed[0]!r}\ncurrent={observed[1]!r}"
+            )
+    print("ok 14. zero-undecodable prompt/footer/journal bytes match f3f7611 in all modes")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -640,6 +678,7 @@ TESTS = [
     test_git_replaces_undecodable_diff_bytes,
     test_engines_replace_undecodable_output_bytes,
     test_undecodable_chunks_are_disclosed_but_never_inlined,
+    test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte,
 ]
 
 
