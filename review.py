@@ -311,7 +311,14 @@ class GitAuth:
         self._dir.cleanup()
 
 
-def git(args, cwd, auth, check=True, capture=True):
+def git(args, cwd, auth, check=True, capture=True, errors="replace"):
+    """Run git, decoding its output leniently so undecodable bytes cannot kill a review.
+
+    `errors` defaults to `replace`: callers that only read git's output as prose want
+    U+FFFD and nothing surrogate-shaped leaking into a prompt. The diff call overrides it
+    to `surrogateescape` because it needs to tell "bytes git could not decode" apart from
+    "this file genuinely contains U+FFFD" — see `has_undecodable_bytes`.
+    """
     proc = subprocess.run(
         [GIT, *args],
         cwd=cwd,
@@ -319,7 +326,7 @@ def git(args, cwd, auth, check=True, capture=True):
         capture_output=capture,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors=errors,
     )
     if check and proc.returncode != 0:
         die(f"git {' '.join(args)} failed (rc={proc.returncode}):\n{proc.stderr}")
@@ -654,8 +661,9 @@ class DiffMode:
     ORDER. It never decides scope — an unranked file is packed after the ranked ones and,
     if it still does not fit, it is listed exactly as it would have been anyway.
 
-    `undecodable_files` counts chunks containing U+FFFD after lenient subprocess
-    decoding. Those chunks are named and disclosed, but never sent to either engine.
+    `undecodable_files` counts chunks whose diff text carries bytes that are not valid
+    UTF-8 (`has_undecodable_bytes`). Those chunks are named and disclosed, but never sent
+    to either engine. A file that merely contains a literal U+FFFD is NOT one of them.
     """
 
     def __init__(self, kind, inlined_files, total_files, inlined_chars, total_chars,
@@ -756,6 +764,33 @@ class Selection:
 
     def __repr__(self):
         return f"Selection({self.status!r}, {len(self.ranked)} ranked)"
+
+
+def has_undecodable_bytes(text):
+    """True when `text` carries bytes git handed us that are not valid UTF-8.
+
+    The diff is decoded with `surrogateescape`, so each undecodable byte survives as a
+    lone surrogate in U+DC80–U+DCFF — a range that CANNOT appear in text decoded from
+    valid UTF-8, which makes this test exact rather than heuristic.
+
+    A U+FFFD sentinel would not be: `errors="replace"` maps an undecodable byte and a
+    literal U+FFFD in the source to the same character, so a perfectly valid UTF-8 file
+    containing one would be excluded from the finder's prompt under a marker asserting,
+    falsely, that it is not readable as text. That is not hypothetical — the two lines
+    below this docstring would have done it to `review.py` itself, permanently blinding
+    the finder to this file on every future PR.
+    """
+    return any("\udc80" <= ch <= "\udcff" for ch in text)
+
+
+def to_display_text(text):
+    """Fold surrogate-escaped bytes back to U+FFFD so a string is safe to encode.
+
+    Only paths reach this: an undecodable file's hunks never enter a prompt, and every
+    inlined chunk is surrogate-free by construction. It exists so a non-UTF-8 *filename*
+    cannot raise `UnicodeEncodeError` on its way into the not-inlined list.
+    """
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 def split_diff_by_file(diff):
@@ -977,7 +1012,10 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
     """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
-    diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
+    # surrogateescape, not replace: only this call needs to distinguish undecodable
+    # bytes from a literal U+FFFD in the source (see has_undecodable_bytes).
+    diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth,
+               errors="surrogateescape").stdout
     numstat = git(["diff", "--numstat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     files = insertions = deletions = 0
     for line in numstat.splitlines():
@@ -990,8 +1028,8 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
         deletions += int(parts[1]) if parts[1].isdigit() else 0
     stats = {"files": files, "insertions": insertions, "deletions": deletions}
     chunks = split_diff_by_file(diff)
-    inlinable = [(path, text) for path, text in chunks if "�" not in text]
-    undecodable = [(path, text) for path, text in chunks if "�" in text]
+    inlinable = [(path, text) for path, text in chunks if not has_undecodable_bytes(text)]
+    undecodable = [(path, text) for path, text in chunks if has_undecodable_bytes(text)]
     selection = None
     if not undecodable and len(diff) <= DIFF_INLINE_CAP:
         kept, elided = inlinable, []
@@ -1040,8 +1078,9 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
     if mode.fully_inlined:
         return f"{stat}\n```diff\n{diff}\n```", mode, stats
     listed = "\n".join(
-        f"- `{path}`" + (
-            " (not valid UTF-8 — not readable as text)" if "�" in text else ""
+        f"- `{to_display_text(path)}`" + (
+            " (not valid UTF-8 — not readable as text)"
+            if has_undecodable_bytes(text) else ""
         )
         for path, text in elided
     )

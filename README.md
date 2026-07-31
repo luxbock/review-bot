@@ -219,11 +219,14 @@ A PR review feeds the finder as much of the diff as `REVIEW_BOT_DIFF_CAP`
 hunks go in if they fit in the remaining budget, and a file that does not fit is
 skipped — later, smaller files still get their chance. The order is the diff's
 own, unless the diff is over the cap and the selection stage below ranked it.
-Git output is decoded as UTF-8 with replacement; a per-file chunk containing
-U+FFFD is treated as undecodable, excluded from both selection and packing, and
-marked by name instead of sending replacement-character garbage to the finder.
-(A source file that literally contains U+FFFD is deliberately treated the same
-way.)
+Git output is decoded leniently, so a file that is binary-as-text (NUL-free, and
+therefore diffed as text) can no longer kill a review. The diff itself is decoded
+with `surrogateescape`, which leaves every undecodable byte as a lone surrogate in
+U+DC80–U+DCFF — a range valid UTF-8 can never produce. A per-file chunk carrying
+one is treated as undecodable: excluded from both selection and packing, and
+marked by name instead of sending garbage to the finder. The test is exact, not a
+heuristic — a file that merely *contains* a literal U+FFFD stays inlinable, which
+matters because `review.py` is such a file.
 That yields three input modes, and how much the finder was shown changes what it
 can find, so the mode is disclosed rather than inferred:
 
@@ -243,8 +246,9 @@ can find, so the mode is disclosed rather than inferred:
   only because it has an undecodable file, `(selection disabled: dry run)` under
   `--dry-run`, and `(selection failed: …)` when it degraded. With undecodable files,
   a `, u not valid UTF-8` clause appears before that suffix (or after `file-list only`),
-  for example `— 5 of 7 files inlined, 41203 of 98211 chars, 1 not valid UTF-8
-  (selection disabled: under cap)`;
+  for example `— 6 of 7 files inlined, 41203 of 98211 chars, 1 not valid UTF-8
+  (selection disabled: under cap)` (that branch packs nothing, so `inlined` there is
+  always `total` minus the undecodable count);
 - a review footer segment directly after `findings` and before `merge-base`:
   ``diff `inlined` ``, ``diff `partial 3/9 files` `` (``diff `partial 3/9 files, selected` ``
   when a ranking chose which k) or ``diff `file-list` ``. The undecodable count follows

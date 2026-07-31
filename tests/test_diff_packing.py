@@ -664,6 +664,70 @@ def test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte():
     print("ok 14. zero-undecodable prompt/footer/journal bytes match f3f7611 in all modes")
 
 
+def test_literal_replacement_char_is_not_undecodable():
+    """A valid UTF-8 file containing U+FFFD must stay inlinable.
+
+    A U+FFFD sentinel cannot tell that file apart from one carrying undecodable bytes,
+    so it would drop it from the finder's prompt under a marker asserting — falsely —
+    that it is not readable as text. review.py is exactly such a file, so the sentinel
+    version of this feature blinded the finder to its own implementation.
+    """
+    with scratch_dir() as tmp:
+        wt = os.path.join(tmp, "mixed-worktree")
+        os.makedirs(wt)
+        subprocess.run([GIT, "init", "-q", wt], check=True)
+        _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
+        base = _git(wt, "rev-parse", "HEAD").strip()
+        # Valid UTF-8 that happens to contain the replacement character, the way any
+        # code testing for it does.
+        with open(os.path.join(wt, "sentinel.py"), "w", encoding="utf-8") as f:
+            f.write('MARKER = "�"  # a literal replacement character\n')
+        with open(os.path.join(wt, "examples.db"), "wb") as f:
+            f.write(b"caf\xe9 latin-1 line\n" * 40)
+        _git(wt, "add", ".")
+        _git(wt, *GIT_ID, "commit", "-qm", "sentinel plus genuinely undecodable file")
+
+        review = fresh_review()
+        review.SELECT_CMD = []
+        review.DIFF_INLINE_CAP = 100000
+        with contextlib.redirect_stderr(io.StringIO()):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+
+        assert mode.undecodable_files == 1, mode
+        assert (mode.inlined_files, mode.total_files) == (1, 2), mode
+        assert "MARKER" in block, "a valid UTF-8 file must be inlined, U+FFFD or not"
+        assert "- `sentinel.py`" not in block, block
+        assert "- `examples.db` (not valid UTF-8 — not readable as text)" in block, block
+    print("ok 15. a literal U+FFFD in valid UTF-8 is not mistaken for undecodable bytes")
+
+
+def test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character():
+    """The classifier keys on lone surrogates, which valid UTF-8 can never produce.
+
+    Also a standing guard on this repo's own sources: any tracked file containing a
+    literal U+FFFD must stay inlinable, or the finder goes blind to it — silently, on
+    every future PR that touches it.
+    """
+    review = fresh_review()
+    assert not review.has_undecodable_bytes("plain ascii\n")
+    # The whole point: a literal U+FFFD is ordinary valid text, not a decode failure.
+    assert not review.has_undecodable_bytes('MARKER = "�"\n')
+    assert review.has_undecodable_bytes(b"caf\xe9\n".decode("utf-8", "surrogateescape"))
+
+    checked = 0
+    for rel in ("review.py", "client.py", "serve.py", "tests/test_diff_packing.py"):
+        with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as f:
+            source = f.read()
+        if "�" not in source:
+            continue
+        checked += 1
+        assert not review.has_undecodable_bytes(source), (
+            f"{rel} classified as undecodable — the finder would never see this file"
+        )
+    assert checked, "guard is vacuous: no tracked source carries a literal U+FFFD"
+    print("ok 16. undecodability keys on bytes, so a literal U+FFFD stays inlinable")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -679,6 +743,8 @@ TESTS = [
     test_engines_replace_undecodable_output_bytes,
     test_undecodable_chunks_are_disclosed_but_never_inlined,
     test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte,
+    test_literal_replacement_char_is_not_undecodable,
+    test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character,
 ]
 
 
