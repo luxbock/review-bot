@@ -318,6 +318,8 @@ def git(args, cwd, auth, check=True, capture=True):
         env=auth.env(),
         capture_output=capture,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if check and proc.returncode != 0:
         die(f"git {' '.join(args)} failed (rc={proc.returncode}):\n{proc.stderr}")
@@ -895,6 +897,7 @@ def select_files_to_inline(chunks, stat, conv_str, cwd, dry_run=False):
     try:
         proc = subprocess.run(
             SELECT_CMD, input=prompt, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=SELECT_TIMEOUT,
         )
     except FileNotFoundError:
@@ -1144,7 +1147,8 @@ def run_engine(harness, prompt, cwd, dry_run=False):
     log(f"running {harness} ({cmd[0]}) in {cwd} …")
     try:
         proc = subprocess.run(
-            cmd, input=prompt, cwd=cwd, capture_output=True, text=True, timeout=ENGINE_TIMEOUT
+            cmd, input=prompt, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=ENGINE_TIMEOUT
         )
     except FileNotFoundError:
         die(f"harness binary not found: {cmd[0]} (is {harness} on PATH?)")

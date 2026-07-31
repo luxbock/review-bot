@@ -115,7 +115,8 @@ class RecordingCheckout:
 # ── git fixture: N files whose per-file diff sizes we dial independently ──────
 def _git(wt, *args):
     return subprocess.run(
-        [GIT, "-C", wt, *args], check=True, capture_output=True, text=True
+        [GIT, "-C", wt, *args], check=True, capture_output=True, text=True,
+        errors="replace",
     ).stdout
 
 
@@ -505,6 +506,56 @@ def test_handles_renames_deletions_modes_binaries_and_odd_names():
     print("ok 10. renames, deletions, mode changes, binaries and odd names all parse")
 
 
+# ── 11. git text output containing bytes outside UTF-8 ───────────────────────
+def test_git_replaces_undecodable_diff_bytes():
+    with scratch_dir() as tmp:
+        wt = os.path.join(tmp, "undecodable-worktree")
+        os.makedirs(wt)
+        subprocess.run([GIT, "init", "-q", wt], check=True)
+        _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
+        base = _git(wt, "rev-parse", "HEAD").strip()
+        with open(os.path.join(wt, "examples.db"), "wb") as f:
+            f.write(b"caf\xe9 latin-1 line\n" * 40)
+        _git(wt, "add", "examples.db")
+        _git(wt, *GIT_ID, "commit", "-qm", "add NUL-free non-UTF-8 file")
+
+        raw_diff = subprocess.run(
+            [GIT, "-C", wt, "diff", f"{base}..HEAD"],
+            check=True, capture_output=True,
+        ).stdout
+        assert b"Binary files" not in raw_diff, "fixture must exercise git's text diff path"
+        assert b"\xe9" in raw_diff, "fixture must carry the undecodable byte into git output"
+
+        review = fresh_review()
+        proc = review.git(["diff", f"{base}..HEAD"], cwd=wt, auth=_Auth())
+        assert "�" in proc.stdout, proc.stdout
+    print("ok 11. git text output replaces undecodable bytes instead of raising")
+
+
+def test_engines_replace_undecodable_output_bytes():
+    with scratch_dir() as tmp:
+        engine = os.path.join(tmp, "invalid-output.py")
+        with open(engine, "w") as f:
+            f.write("#!" + sys.executable + "\n")
+            f.write("import sys\n")
+            f.write("sys.stdin.read()\n")
+            f.write("sys.stdout.buffer.write(b'answer: \\xff\\n')\n")
+        os.chmod(engine, os.stat(engine).st_mode | stat.S_IEXEC | stat.S_IRWXU)
+
+        review = fresh_review()
+        review.CLAUDE_CMD = [engine]
+        assert review.run_engine("claude", "prompt", tmp) == "answer: �\n"
+
+        review.SELECT_CMD = [engine]
+        selection = review.select_files_to_inline(
+            [("file.py", "diff --git a/file.py b/file.py\n")],
+            "file.py | 1 +\n", "(none found)", tmp,
+        )
+        assert selection.status == "unparsed", selection.status
+        assert "�" in selection.detail, selection.detail
+    print("ok 12. finder and selection engines replace undecodable output bytes")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -516,6 +567,8 @@ TESTS = [
     test_empty_result_on_partial_input_end_to_end,
     test_replays_the_org_gtd_cli_52_case,
     test_handles_renames_deletions_modes_binaries_and_odd_names,
+    test_git_replaces_undecodable_diff_bytes,
+    test_engines_replace_undecodable_output_bytes,
 ]
 
 
