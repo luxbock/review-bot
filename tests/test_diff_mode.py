@@ -51,6 +51,9 @@ def wire_review(review):
     review.AUDIT_PROMPT_FILE = os.path.join(REPO_ROOT, "audit-prompt.md")
     review.AUDIT_VERIFY_PROMPT_FILE = os.path.join(REPO_ROOT, "audit-verify-prompt.md")
     review.AUDIT_SYNTHESIS_PROMPT_FILE = os.path.join(REPO_ROOT, "audit-synthesis-prompt.md")
+    # The #35 selection stage is off in this file: it would fire on the over-cap cases
+    # and its default command is a REAL engine. No test may reach a live model.
+    review.SELECT_CMD = []
     return review
 
 

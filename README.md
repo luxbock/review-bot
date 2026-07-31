@@ -215,23 +215,30 @@ order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
 ## Diff input mode
 
 A PR review feeds the finder as much of the diff as `REVIEW_BOT_DIFF_CAP`
-(default 60000 chars) allows, packed **whole file by whole file** in the diff's
-own order: each file's hunks go in if they fit in the remaining budget, and a
-file that does not fit is skipped — later, smaller files still get their chance.
+(default 60000 chars) allows, packed **whole file by whole file**: each file's
+hunks go in if they fit in the remaining budget, and a file that does not fit is
+skipped — later, smaller files still get their chance. The order is the diff's
+own, unless the diff is over the cap and the selection stage below ranked it.
 That yields three input modes, and how much the finder was shown changes what it
 can find, so the mode is disclosed rather than inferred:
 
 | mode | what the prompt carries |
 | --- | --- |
 | `inlined` | every file's hunks |
-| `partial k/n files` | k whole files' hunks, plus the names of the other n−k |
+| `partial k/n files` | k whole files' hunks, plus the names of the other n−k (`, selected` when a ranking chose which k) |
 | `file-list` | no hunks at all — `git diff --stat` and the instruction to read the checkout |
 
-- a journal line, emitted before any engine runs —
-  `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars`
-  (the other two wordings are `— inlined` and `— file-list only`);
+- a journal line, emitted before the **finder** runs — on an over-cap diff the selection
+  stage has already run and logged its own `selecting inline order over N files …` line
+  above this one —
+  `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars (selection ranked 3: …)`
+  (the other two wordings are `— inlined` and `— file-list only`). A `partial` line
+  **always** carries a `(selection …)` suffix; it reads `(selection disabled)` when the
+  stage was off, `(selection disabled: dry run)` under `--dry-run`, and
+  `(selection failed: …)` when it degraded;
 - a review footer segment directly after `findings` and before `merge-base`:
-  ``diff `inlined` ``, ``diff `partial 3/9 files` `` or ``diff `file-list` ``.
+  ``diff `inlined` ``, ``diff `partial 3/9 files` `` (``diff `partial 3/9 files, selected` ``
+  when a ranking chose which k) or ``diff `file-list` ``.
 
 Whole files only: a half-diff is worse input than an honest omission, and the
 engine cannot tell the two apart unless it is told. When not even one file fits
@@ -248,6 +255,42 @@ Before #34 the cap was all-or-nothing, so a diff 2% over it lost 100% of its
 hunks: `olli/org-gtd-cli#52` was reviewed twice that way, at 61,313 and 64,704
 chars against a 60,000 cap, the second returning a zero-finding ✅ on a
 three-file change the finder had never been shown.
+
+### Choosing what to inline
+
+Packing in source order is arbitrary when the change is much larger than the cap
+— the diff's own order says nothing about which files repay reading. So **when
+and only when the diff is over the cap**, a deliberately cheap engine ranks the
+files first (`REVIEW_BOT_SELECT_CMD`, default
+`claude -p --output-format json --model haiku`; empty disables the stage). It is
+handed metadata only — `--stat`, each file's diff header and its `@@` hunk
+headers, and the repo's convention files — never hunk bodies, and it returns a
+ranked list of paths with a one-clause reason each.
+
+The ranking decides **order, never scope**:
+
+- the packer still decides what fits, so a highly-ranked but enormous file can
+  still miss the budget;
+- files the ranking omits are packed behind the ranked ones, and if they do not
+  fit they appear in the same not-inlined list with the same instruction to read
+  them from the checkout — selection narrows what is *inlined*, never what the
+  reviewer may look at;
+- the reply is untrusted data: a path that is not in this diff is discarded, a
+  duplicate collapses, a reason is flattened to one clipped line, and nothing
+  else in the object is read. There is no path by which a ranking becomes a
+  finding.
+
+Every failure — the stage disabled, the binary missing, a non-zero exit, a
+timeout, unparseable output, an empty or entirely hallucinated list — degrades to
+source-order packing and says which in the journal
+(`selection failed: …` / `unparsed` / `empty` / `disabled`). Losing a hint is
+never worth losing a review.
+
+When a ranking did shape the order, the footer says so —
+``diff `partial 7/23 files, selected` `` — and the journal line carries the
+ranked paths with their reasons. The reasons stay in the journal deliberately:
+they are a cheap engine's prose about untrusted input, and the footer is where a
+human reads a verdict.
 
 ### The A/B harness
 
