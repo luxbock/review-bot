@@ -1536,17 +1536,20 @@ def _describe_findings(parse):
     """`findings` as the engine sent it. The length matters and is easy to miss: this line
     is only ever printed when zero drafts survived, so a non-zero length means normalize*
     discarded every entry — say so instead of printing a bare `list`."""
-    kind = parse.get("findings_kind", "(none)")
     report = parse.get("normalize_report")
     if isinstance(report, dict):
         discarded = report.get("findings_discarded", 0)
-        length = report.get("findings_received")
-    else:
-        # Pre-report diagnostics only carried the raw list length. This function is called
-        # for an empty normalized result, so a non-zero legacy length means all were lost.
-        length = parse.get("findings_len")
-        discarded = length
-    if kind != "list" or not discarded:
+        if discarded:
+            return (
+                f"list of {report.get('findings_received')} — "
+                "every entry discarded by normalize"
+            )
+        return parse.get("findings_kind", "(none)")
+    # Pre-report diagnostics only carried the raw list length. This function is called
+    # for an empty normalized result, so a non-zero legacy length means all were lost.
+    kind = parse.get("findings_kind", "(none)")
+    length = parse.get("findings_len")
+    if kind != "list" or not length:
         return kind
     return f"list of {length} — every entry discarded by normalize"
 
