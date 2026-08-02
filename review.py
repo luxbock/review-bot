@@ -1529,40 +1529,66 @@ def _describe_findings(parse):
     is only ever printed when zero drafts survived, so a non-zero length means normalize*
     discarded every entry — say so instead of printing a bare `list`."""
     kind = parse.get("findings_kind", "(none)")
-    length = parse.get("findings_len")
-    if kind != "list" or not length:
+    report = parse.get("normalize_report")
+    if isinstance(report, dict):
+        discarded = report.get("findings_discarded", 0)
+        length = report.get("findings_received")
+    else:
+        # Pre-report diagnostics only carried the raw list length. This function is called
+        # for an empty normalized result, so a non-zero legacy length means all were lost.
+        length = parse.get("findings_len")
+        discarded = length
+    if kind != "list" or not discarded:
         return kind
     return f"list of {length} — every entry discarded by normalize"
 
 
 def empty_finder_is_genuine(parse, mode):
-    """Did the engine really answer with an empty result, or did normalize() default its
-    way there? Either tell is sufficient, and each mode has its own:
+    """Decide whether an empty result was genuine from normalize*'s report vocabulary.
 
-    - an explicit empty `findings` list — the universal one; the audit schema has nothing
-      else, since it carries no `verdict` by design (AUDIT_SCHEMA_HINT, normalize_audit),
-      so demanding one there would report every clean audit as a parse pathology;
-    - `"findings": null`, which normalize* collapses to [] identically and which an engine
-      plausibly means as "no findings". The other falsy shapes ({} / "" / 0) collapse the
-      same way but are malformed rather than answers, so they stay pathologies;
-    - a RECOGNISED `verdict` with NO `findings` key at all, in PR mode. Requiring a list as
-      well would flag the common shorthand {"verdict":"approve","summary":…} — a real
-      approve with the empty array left out — as a pathology, sending a reader after a bug
-      that is not there. Checking the verdict's value rather than mere presence is what
-      keeps a quoted schema ("approve|comment|request_changes") from passing as an answer.
-      `missing` rather than "any non-list" is what holds those malformed falsy shapes out
-      of this escape hatch; discarded entries are already caught by the list branch."""
+    `findings_source` distinguishes absent, null, list, and malformed non-list input;
+    `findings_received` preserves the received list length; `schema_has_verdict` says
+    whether this normalizer's schema includes a verdict; and `verdict_source` records
+    whether the normalizer accepted the engine's value. The decision below is the only
+    interpretation of those fields."""
     if not parse:
         return False
-    kind = parse.get("findings_kind")
-    if kind == "null":
+    report = parse.get("normalize_report")
+    if not isinstance(report, dict):
+        # Compatibility projection only: case 17 hand-builds raw parse records, while
+        # tools/finder_ab.py must classify pre-report journals without importing this
+        # placeholder-bearing file. Both translate the old vocabulary; neither gets a
+        # second copy of the decision below.
+        kind = parse.get("findings_kind")
+        if kind == "missing":
+            findings_source = "absent"
+        elif kind in ("null", "list"):
+            findings_source = kind
+        else:
+            findings_source = f"non-list:{kind}"
+        if parse.get("verdict_raw") in VERDICT_LABEL:
+            verdict_source = "engine"
+        elif parse.get("verdict_present"):
+            verdict_source = "unrecognised"
+        else:
+            verdict_source = "absent"
+        report = {
+            "findings_source": findings_source,
+            "findings_received": parse.get("findings_len") if kind == "list" else None,
+            "schema_has_verdict": mode != "repo",
+            "verdict_source": verdict_source,
+        }
+
+    source = report.get("findings_source")
+    if source == "null":
         return True
-    if kind == "list":
-        # An EXPLICITLY empty list. A list that was non-empty and still reached zero
-        # drafts means normalize* discarded every entry (both silently `continue` past a
-        # non-dict), which is manufacturing, not answering — the case this exists to catch.
-        return parse.get("findings_len") == 0
-    return mode != "repo" and kind == "missing" and parse.get("verdict_raw") in VERDICT_LABEL
+    if source == "list":
+        return report.get("findings_received") == 0
+    return (
+        source == "absent"
+        and report.get("schema_has_verdict") is True
+        and report.get("verdict_source") == "engine"
+    )
 
 
 def log_empty_finder_diagnostic(harness, diag):
@@ -1570,15 +1596,21 @@ def log_empty_finder_diagnostic(harness, diag):
     diag = diag or {}
     parse = diag.get("parse") or {}
     mode = diag.get("mode", "pr")
-    call = (
-        "genuine empty result"
-        if empty_finder_is_genuine(parse, mode)
-        else "DEFAULTED — not a real result object"
-    )
-    if mode == "repo":
+    genuine = empty_finder_is_genuine(parse, mode)
+    _fill_diag(diag, empty_finder_is_genuine=genuine)
+    call = "genuine empty result" if genuine else "DEFAULTED — not a real result object"
+    report = parse.get("normalize_report") or {}
+    verdict_source = report.get("verdict_source")
+    if verdict_source == "n/a" or (not report and mode == "repo"):
         verdict_note = "n/a, the audit schema carries none"
     else:
-        verdict_note = "present" if parse.get("verdict_present") else "ABSENT — defaulted"
+        if not report:
+            verdict_source = (
+                "engine"
+                if parse.get("verdict_raw") in VERDICT_LABEL
+                else "absent"
+            )
+        verdict_note = "present" if verdict_source == "engine" else "ABSENT — defaulted"
     retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
     log(
         f"EMPTY FINDER ({harness}, {mode} mode): {call}. Zero drafts{retry} "
@@ -1591,15 +1623,17 @@ def log_empty_finder_diagnostic(harness, diag):
 
 
 def triage_disposition_was_defaulted(parse):
-    """Did the POSTED disposition come from the engine, or from us? normalize_triage
-    substitutes `needs-info` both when `disposition` is absent and when it is present but
-    unrecognised, so either case posts a confident disposition nobody produced — the
-    triage analogue of an empty finder rendering as a confident green."""
+    """Did the posted disposition come from the engine according to normalize_triage?"""
     if not parse:
         return False
-    if not parse.get("disposition_present"):
-        return True
-    return parse.get("disposition_raw") not in DISPOSITIONS
+    report = parse.get("normalize_report")
+    if isinstance(report, dict):
+        disposition_source = report.get("disposition_source")
+    else:
+        disposition_source = (
+            "engine" if parse.get("disposition_raw") in DISPOSITIONS else "unrecognised"
+        )
+    return disposition_source != "engine"
 
 
 def log_defaulted_triage_diagnostic(harness, diag, stage, posted):
