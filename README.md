@@ -510,7 +510,7 @@ The repo carries a deliberately nixpkgs-only `flake.nix`. From a checkout:
 
 ```sh
 nix build .#default        # the packaged artifact
-nix flake check            # the same, plus the full test suite, hermetically
+nix flake check            # the package AND the full test suite, hermetically
 nix develop                # the project toolchain — python3, git, curl, jq, nixfmt
 nix fmt                    # format the .nix files
 ```

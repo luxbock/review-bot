@@ -23,7 +23,9 @@
   #
   # So the gates a worker runs are now, from the repo root:
   #   nix build .#default          — the packaged artifact
-  #   nix flake check              — the same, plus the full test suite
+  #   nix flake check              — the package AND the full test suite (both are
+  #                                  under `checks`; see the note there for why the
+  #                                  package has to be listed explicitly)
   #   nix develop --command ...    — the project toolchain, exhaustively
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -48,6 +50,15 @@
 
           checks = {
             review-bot-tests = reviewBot.passthru.tests;
+            # The package MUST be in `checks`, not merely in `packages`. `nix flake
+            # check` realises the derivations under `checks` and only EVALUATES the
+            # ones under `packages`, and passthru.tests is a standalone runCommand
+            # that never references this derivation's $out. Without this entry a
+            # renamed @…@ placeholder in review.py leaves `nix flake check` fully
+            # green while `nix build .#default` fails on the `--replace-fail` — i.e.
+            # the gate would be blind to the exact breakage class it exists to catch,
+            # since the tests load review.py with its placeholders still in place.
+            review-bot-package = reviewBot;
             default = reviewBot.passthru.tests;
           };
 

@@ -360,7 +360,7 @@ def main(argv=None):
     ap.add_argument(
         "--binary",
         default="",
-        help="path to review-bot-review-local (default: nix-build the package)",
+        help="path to review-bot-review-local (default: nix build .#default)",
     )
     args = ap.parse_args(argv)
     if args.runs < 1:

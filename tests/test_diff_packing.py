@@ -76,11 +76,26 @@ def scratch_dir():
         shutil.rmtree(path, ignore_errors=True)
 
 
+# Every git this file runs must be insulated from the developer's own config, not just
+# from the system one. The golden fixture records raw `git diff` bytes, and a global
+# `core.abbrev` silently rewrites the `index a..b` hashes — so without this the suite
+# passes in CI and under `nix flake check` (where default.nix pins HOME and
+# GIT_CONFIG_GLOBAL) while failing from a checkout, and the failure message would talk
+# the developer into committing a config-tainted golden. The other suites
+# (test_merge_base, test_head_sync, test_checkout_isolation) already pin both.
+GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+}
+
+
+def git_env():
+    return {**os.environ, **GIT_ENV}
+
+
 class _Auth:
     def env(self):
-        e = dict(os.environ)
-        e["GIT_CONFIG_NOSYSTEM"] = "1"
-        return e
+        return git_env()
 
 
 class _Args:
@@ -116,7 +131,7 @@ class RecordingCheckout:
 def _git(wt, *args):
     return subprocess.run(
         [GIT, "-C", wt, *args], check=True, capture_output=True, text=True,
-        errors="replace",
+        errors="replace", env=git_env(),
     ).stdout
 
 
@@ -125,7 +140,7 @@ def make_multi_file_tree(parent, payloads):
     payloads[i] 'x' characters. Returns (worktree, base_sha)."""
     wt = os.path.join(parent, "private-worktree")
     os.makedirs(wt)
-    subprocess.run([GIT, "init", "-q", wt], check=True)
+    subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
     for i in range(len(payloads)):
         with open(os.path.join(wt, f"file{i}.txt"), "w") as f:
             f.write("x\n")
@@ -440,7 +455,7 @@ def make_edge_case_tree(parent):
     """A tree exercising every per-file diff shape that is not a plain edit."""
     wt = os.path.join(parent, "edge-worktree")
     os.makedirs(wt)
-    subprocess.run([GIT, "init", "-q", wt], check=True)
+    subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
     with open(os.path.join(wt, "renamed-from.txt"), "w") as f:
         f.write("a\n" * 20)
     with open(os.path.join(wt, "deleted.txt"), "w") as f:
@@ -510,7 +525,7 @@ def test_handles_renames_deletions_modes_binaries_and_odd_names():
 def make_undecodable_tree(parent, include_source=True):
     wt = os.path.join(parent, "undecodable-worktree")
     os.makedirs(wt)
-    subprocess.run([GIT, "init", "-q", wt], check=True)
+    subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
     _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
     base = _git(wt, "rev-parse", "HEAD").strip()
     if include_source:
@@ -725,7 +740,7 @@ def test_literal_replacement_char_is_not_undecodable():
     with scratch_dir() as tmp:
         wt = os.path.join(tmp, "mixed-worktree")
         os.makedirs(wt)
-        subprocess.run([GIT, "init", "-q", wt], check=True)
+        subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
         _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
         base = _git(wt, "rev-parse", "HEAD").strip()
         # Valid UTF-8 that happens to contain the replacement character, the way any
