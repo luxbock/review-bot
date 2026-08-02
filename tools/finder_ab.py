@@ -89,8 +89,8 @@ DIFF_LOG_RE = re.compile(r"diff (\d+) chars vs cap (\d+) — ")
 # explainable from the record instead of only reproducible by re-running.
 EMPTY_DIAG_RE = re.compile(r"empty-finder diagnostic: (\{.*\})\s*$", re.MULTILINE)
 EMPTY_DIAG_UNPARSED_LIMIT = 4000
-# review.py's VERDICT_LABEL keys, mirrored for the same reason describe_empty_diag mirrors
-# empty_finder_is_genuine: this tool drives the built binary and cannot import review.py.
+# review.py's VERDICT_LABEL keys, retained only for describe_empty_diag's compatibility
+# fallback for journals written before review.py recorded its own conclusion.
 VERDICT_VALUES = ("approve", "comment", "request_changes")
 
 
@@ -291,17 +291,16 @@ def describe_empty_diag(record):
     if not parse:
         return "engine output never parsed as JSON"
     mode = diag.get("mode", "pr")
-    # Mirrors review.py's empty_finder_is_genuine. Duplicated rather than imported: this
-    # tool drives the BUILT binary, and review.py in-tree carries build placeholders.
-    # Either tell suffices — an EXPLICITLY EMPTY list (a non-empty one that still reached
-    # zero drafts means normalize* discarded its entries), or (PR mode only, since the
-    # audit schema carries none) a recognised verdict with no `findings` key at all.
-    # `null` counts: normalize* collapses it to [] identically. The other falsy shapes
-    # ({} / "" / 0) collapse the same way but are malformed rather than answers.
     kind, length = parse.get("findings_kind"), parse.get("findings_len")
-    genuine = (kind == "null" or (length == 0 if kind == "list" else
-               mode != "repo" and kind == "missing"
-               and parse.get("verdict_raw") in VERDICT_VALUES))
+    if "empty_finder_is_genuine" in diag:
+        genuine = diag["empty_finder_is_genuine"] is True
+    else:
+        # Compatibility for journals from older built binaries. This tool cannot import
+        # in-tree review.py because that file carries build placeholders, so the legacy
+        # raw-parse vocabulary remains here only until those journals age out.
+        genuine = (kind == "null" or (length == 0 if kind == "list" else
+                   mode != "repo" and kind == "missing"
+                   and parse.get("verdict_raw") in VERDICT_VALUES))
     label = "genuine empty result" if genuine else "DEFAULTED — not a real result object"
     verdict = ("verdict n/a (audit schema)" if mode == "repo"
                else f"verdict {parse.get('verdict_raw')!r}")

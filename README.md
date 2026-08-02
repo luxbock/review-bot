@@ -163,29 +163,28 @@ review-bot-review: empty-finder diagnostic: {"harness": "claude", "parse": {…}
 
 The second line is one JSON object: the harness, the raw output size and a
 head+tail excerpt of it (4000 chars, with the elided count stated), whether the
-JSON-repair retry fired, and — the discriminator — the *pre-normalization* facts
-`verdict_present`, `verdict_raw`, `findings_kind`, `findings_len`, `keys` and the
-`path` by which the JSON was reached, plus the `mode` that ran. Case 1 shows
-`findings_kind: "list"` with `findings_len: 0` (or, in PR mode, a recognised `verdict_raw`
-and no `findings` key); case 2 shows the keys of whatever was actually scraped.
+JSON-repair retry fired, and the *pre-normalization* facts `verdict_present`,
+`verdict_raw`, `findings_kind`, `findings_len`, `keys` and the `path` by which the JSON
+was reached. Beside those raw facts, `normalize_report` records `schema`,
+`schema_has_verdict`, `findings_source`, `findings_received`, `findings_discarded`,
+`verdict_source` and `disposition_source`. The object also carries the `mode` that ran
+and the report-derived `empty_finder_is_genuine` conclusion. Case 1's raw record shows
+`findings_kind: "list"` with `findings_len: 0`; case 2 shows the keys and shapes of
+whatever was actually scraped.
 
-The discriminator follows the schema of the mode that ran, and **either tell suffices**:
+The discriminator follows the schema that the normalizer reports, and the result is
+genuine when **any one** of these report conditions holds:
 
-- an **explicitly empty** `findings` list — the universal one, and the audit schema's only
-  one, since it carries no `verdict` by design (`AUDIT_SCHEMA_HINT`, `normalize_audit`);
-  demanding a verdict there would report every clean repo audit as a parse pathology. The
-  list must have been empty as sent: `normalize*` silently drops non-dict entries, so a
-  list that was non-empty and still reached zero drafts is manufacturing, not answering,
-  and the journal line says `list of N — every entry discarded by normalize`.
-- `"findings": null` — recorded as `findings_kind: "null"` and counted as an answer, since
-  `normalize*`'s `obj.get("findings") or []` collapses it to the empty-list case
-  identically and it is the one non-list shape an engine plausibly means as "no findings".
-  The other falsy shapes (`{}`, `""`, `0`) collapse the same way but are malformed rather
-  than answers, so they remain case 2.
-- in **PR mode**, a **recognised** `verdict` value with no `findings` key at all, so the
-  common shorthand `{"verdict":"approve","summary":…}` is not flagged. The *value* is
-  checked rather than mere presence, which keeps a quoted schema
-  (`"approve|comment|request_changes"`) from passing as an answer.
+- `findings_source == "null"`;
+- `findings_source == "list"` and `findings_received == 0`;
+- `findings_source == "absent"`, `schema_has_verdict` is true, and
+  `verdict_source == "engine"`.
+
+Everything else is defaulted, including every `non-list:*` source and every list received
+non-empty. When all entries in such a list are discarded, `findings_discarded` supplies
+the count for the byte-stable journal wording `list of N — every entry discarded by
+normalize`. Audit reports set `schema_has_verdict` false; review reports accept the common
+verdict-only shorthand only when the normalizer records its verdict source as `engine`.
 Under `review-bot-serve` these land in the service journal; `poll.py` discards a
 successful review's stderr, so read the service unit, not the poller.
 
