@@ -214,7 +214,8 @@ order—for example, ``findings `claude 3→1, codex 2→0, synthesized` ``. The
 ## Diff input mode
 
 A PR review feeds the finder as much of the diff as `REVIEW_BOT_DIFF_CAP`
-(default 60000 chars) allows, packed **whole file by whole file**: each file's
+(default 250000 chars, the same value the deployed unit sets) allows, packed
+**whole file by whole file**: each file's
 hunks go in if they fit in the remaining budget, and a file that does not fit is
 skipped — later, smaller files still get their chance. The order is the diff's
 own, unless the diff is over the cap and the selection stage below ranked it.
@@ -238,7 +239,7 @@ can find, so the mode is disclosed rather than inferred:
 - a journal line, emitted before the **finder** runs — on an over-cap diff the selection
   stage has already run and logged its own `selecting inline order over N files …` line
   above this one —
-  `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars (selection ranked 3: …)`
+  `review-bot-review: diff 868564 chars vs cap 250000 — 3 of 9 files inlined, 238204 of 868564 chars (selection ranked 3: …)`
   (the other two wordings are `— inlined` and `— file-list only`). A `partial` line
   **always** carries a `(selection …)` suffix; it reads `(selection disabled)` when the
   stage was off, `(selection disabled: under cap)` when an under-cap diff is partial

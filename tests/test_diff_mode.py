@@ -373,7 +373,7 @@ if chars == "0":
 # Reports a cap the harness did NOT force, standing in for the socket client, which
 # drops REVIEW_BOT_DIFF_CAP and runs at the service default while still relaying a
 # well-formed journal line.
-reported_cap = os.environ.get("FINDER_AB_TEST_REPORT_CAP", cap or "60000")
+reported_cap = os.environ.get("FINDER_AB_TEST_REPORT_CAP", cap or "250000")
 sys.stderr.write(
     "review-bot-review: diff " + chars + " chars vs cap " + reported_cap
     + " — " + ("inlined" if mode == "inlined" else "file-list only") + "\n"
@@ -592,7 +592,7 @@ def test_finder_ab_refuses_a_cap_that_did_not_take():
     with scratch_dir() as tmp:
         stub, _log = make_stub_binary(tmp)
         os.environ.pop("FINDER_AB_TEST_EXIT", None)
-        os.environ["FINDER_AB_TEST_REPORT_CAP"] = "60000"  # the service default, not ours
+        os.environ["FINDER_AB_TEST_REPORT_CAP"] = "250000"  # the service default, not ours
         out = os.path.join(tmp, "finder-ab.jsonl")
         err = io.StringIO()
         try:
@@ -614,7 +614,7 @@ def test_finder_ab_refuses_a_cap_that_did_not_take():
     assert "review-bot-review-local" in msg, msg
     # The run that exposed it is still recorded — aborting must not discard evidence.
     assert len(records) == 1, records
-    assert records[0]["diff_cap_observed"] == 60000, records[0]
+    assert records[0]["diff_cap_observed"] == 250000, records[0]
     print("ok 10. finder_ab: a forced cap that never reached the reviewer aborts")
 
 

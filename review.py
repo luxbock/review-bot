@@ -83,7 +83,14 @@ ENGINE_TIMEOUT = int(os.environ.get("REVIEW_BOT_ENGINE_TIMEOUT", "1800"))
 # happens to share its (possibly reused) owner pid. Default 6h — comfortably above any
 # real multi-engine run (ENGINE_TIMEOUT is 30min per engine).
 WT_STALE_SECS = int(os.environ.get("REVIEW_BOT_WT_STALE_SECS", "21600"))
-DIFF_INLINE_CAP = int(os.environ.get("REVIEW_BOT_DIFF_CAP", "60000"))
+# Mirrors the deployed service (nixos-config hosts/convox/review-bot-service.nix sets
+# REVIEW_BOT_DIFF_CAP=250000). The default was 60000 from the nixos-config import until
+# production was tuned up and the repo default was never brought along, so an unforced
+# local run — `review-bot-review-local`, which is what tools/finder_ab.py drives — showed
+# the finder a quarter of what production shows it. Measurements taken that way described
+# an instrument nobody runs. The unit still sets the value explicitly; this default is
+# what makes a local run reproduce production rather than silently under-feed the finder.
+DIFF_INLINE_CAP = int(os.environ.get("REVIEW_BOT_DIFF_CAP", "250000"))
 # Empty-verdict calibration: a zero-finding result is read against the size of the diff
 # it was asked about. On a small change an empty finder is the expected answer for a
 # clean PR; issue #21 measured the finder returning 2, 2, 0 findings on byte-identical
