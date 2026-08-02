@@ -1287,18 +1287,47 @@ def find_json_object(text):
     return None
 
 
-def normalize(obj):
+def normalize(obj, report=None):
     if not isinstance(obj, dict):
         die("engine returned non-object JSON")
+    _fill_diag(
+        report,
+        schema="review",
+        schema_has_verdict=True,
+        disposition_source="n/a",
+    )
     verdict = obj.get("verdict", "comment")
     if verdict not in VERDICT_LABEL:
+        verdict_source = "absent" if "verdict" not in obj else "unrecognised"
         verdict = "comment"
+    else:
+        verdict_source = "engine"
+    _fill_diag(report, verdict_source=verdict_source)
+
+    if "findings" not in obj:
+        findings_source, findings_received = "absent", None
+    elif obj["findings"] is None:
+        findings_source, findings_received = "null", None
+    elif isinstance(obj["findings"], list):
+        findings_source, findings_received = "list", len(obj["findings"])
+    else:
+        findings_source = f"non-list:{type(obj['findings']).__name__}"
+        findings_received = None
+    _fill_diag(
+        report,
+        findings_source=findings_source,
+        findings_received=findings_received,
+        findings_discarded=0,
+    )
     findings = obj.get("findings") or []
     if not isinstance(findings, list):
         findings = []
     clean = []
+    findings_discarded = 0
     for f in findings:
         if not isinstance(f, dict):
+            findings_discarded += 1
+            _fill_diag(report, findings_discarded=findings_discarded)
             continue
         sev = f.get("severity", "question")
         if sev not in SEVERITY_ORDER:
@@ -1318,12 +1347,25 @@ def normalize(obj):
     return {"verdict": verdict, "summary": str(obj.get("summary", "") or ""), "findings": clean}
 
 
-def normalize_triage(obj):
+def normalize_triage(obj, report=None):
     if not isinstance(obj, dict):
         die("engine returned non-object JSON")
+    _fill_diag(
+        report,
+        schema="triage",
+        schema_has_verdict=False,
+        findings_source="n/a",
+        findings_received=None,
+        findings_discarded=0,
+        verdict_source="n/a",
+    )
     disp = obj.get("disposition", "needs-info")
     if disp not in DISPOSITIONS:
+        disposition_source = "absent" if "disposition" not in obj else "unrecognised"
         disp = "needs-info"
+    else:
+        disposition_source = "engine"
+    _fill_diag(report, disposition_source=disposition_source)
     conf = obj.get("confidence", "medium")
     if conf not in ("high", "medium", "low"):
         conf = "medium"
@@ -1337,18 +1379,43 @@ def normalize_triage(obj):
     }
 
 
-def normalize_audit(obj):
+def normalize_audit(obj, report=None):
     """Normalize the audit schema: a ranked finding list with NO verdict. Reuses the same
     finding shape and severity sanitising as normalize(); preserves the engine's ordering
     (findings are returned most-severe-first, so we do NOT re-sort here)."""
     if not isinstance(obj, dict):
         die("engine returned non-object JSON")
+    _fill_diag(
+        report,
+        schema="audit",
+        schema_has_verdict=False,
+        verdict_source="n/a",
+        disposition_source="n/a",
+    )
+    if "findings" not in obj:
+        findings_source, findings_received = "absent", None
+    elif obj["findings"] is None:
+        findings_source, findings_received = "null", None
+    elif isinstance(obj["findings"], list):
+        findings_source, findings_received = "list", len(obj["findings"])
+    else:
+        findings_source = f"non-list:{type(obj['findings']).__name__}"
+        findings_received = None
+    _fill_diag(
+        report,
+        findings_source=findings_source,
+        findings_received=findings_received,
+        findings_discarded=0,
+    )
     findings = obj.get("findings") or []
     if not isinstance(findings, list):
         findings = []
     clean = []
+    findings_discarded = 0
     for f in findings:
         if not isinstance(f, dict):
+            findings_discarded += 1
+            _fill_diag(report, findings_discarded=findings_discarded)
             continue
         sev = f.get("severity", "question")
         if sev not in SEVERITY_ORDER:
@@ -1592,7 +1659,11 @@ def _parse_engine_output(raw, harness, key, norm, accept=()):
             if isinstance(env, dict) and isinstance(env.get("result"), str):
                 text, path = env["result"], "envelope-result"
             elif isinstance(env, dict) and key in env:
-                return norm(env), text, _describe_parsed(env, "envelope-direct")
+                report = {}
+                result = norm(env, report)
+                parse = _describe_parsed(env, "envelope-direct")
+                parse["normalize_report"] = report
+                return result, text, parse
         except json.JSONDecodeError:
             text, path = raw, "raw"
     obj = find_json_object(text)
@@ -1602,7 +1673,10 @@ def _parse_engine_output(raw, harness, key, norm, accept=()):
     if accept and isinstance(obj, dict) and not any(k in obj for k in accept):
         parse["rejected"] = True
         return None, text, parse
-    return norm(obj), text, parse
+    report = {}
+    result = norm(obj, report)
+    parse["normalize_report"] = report
+    return result, text, parse
 
 
 def review_via(harness, prompt, cwd, dry_run, mode="pr", diag=None):
