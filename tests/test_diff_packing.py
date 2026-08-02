@@ -43,9 +43,9 @@ def load_module(name, path):
     return mod
 
 
-def fresh_review():
+def fresh_review(path=None, name="review_diff_packing_test"):
     """review.py wired past its build-time @PLACEHOLDER@s so it runs from the checkout."""
-    review = load_module("review_diff_packing_test", os.path.join(REPO_ROOT, "review.py"))
+    review = load_module(name, path or os.path.join(REPO_ROOT, "review.py"))
     review.GIT = GIT
     review.REVIEW_PROMPT_FILE = os.path.join(REPO_ROOT, "review-prompt.md")
     review.VERIFY_PROMPT_FILE = os.path.join(REPO_ROOT, "verify-prompt.md")
@@ -115,7 +115,8 @@ class RecordingCheckout:
 # ── git fixture: N files whose per-file diff sizes we dial independently ──────
 def _git(wt, *args):
     return subprocess.run(
-        [GIT, "-C", wt, *args], check=True, capture_output=True, text=True
+        [GIT, "-C", wt, *args], check=True, capture_output=True, text=True,
+        errors="replace",
     ).stdout
 
 
@@ -505,6 +506,228 @@ def test_handles_renames_deletions_modes_binaries_and_odd_names():
     print("ok 10. renames, deletions, mode changes, binaries and odd names all parse")
 
 
+# ── 11-14. git text output and compatibility across undecodable handling ─────
+def make_undecodable_tree(parent, include_source=True):
+    wt = os.path.join(parent, "undecodable-worktree")
+    os.makedirs(wt)
+    subprocess.run([GIT, "init", "-q", wt], check=True)
+    _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
+    base = _git(wt, "rev-parse", "HEAD").strip()
+    if include_source:
+        with open(os.path.join(wt, "ordinary.py"), "w") as f:
+            f.write("print('readable')\n")
+    with open(os.path.join(wt, "examples.db"), "wb") as f:
+        f.write(b"caf\xe9 latin-1 line\n" * 40)
+    _git(wt, "add", ".")
+    _git(wt, *GIT_ID, "commit", "-qm", "add NUL-free non-UTF-8 file")
+    raw_diff = subprocess.run(
+        [GIT, "-C", wt, "diff", f"{base}..HEAD"], check=True, capture_output=True,
+    ).stdout
+    assert b"Binary files" not in raw_diff, "fixture must exercise git's text diff path"
+    assert b"\xe9" in raw_diff, "fixture must carry the undecodable byte into git output"
+    return wt, base
+
+
+def test_git_replaces_undecodable_diff_bytes():
+    with scratch_dir() as tmp:
+        wt, base = make_undecodable_tree(tmp, include_source=False)
+
+        review = fresh_review()
+        proc = review.git(["diff", f"{base}..HEAD"], cwd=wt, auth=_Auth())
+        assert "�" in proc.stdout, proc.stdout
+    print("ok 11. git text output replaces undecodable bytes instead of raising")
+
+
+def test_engines_replace_undecodable_output_bytes():
+    with scratch_dir() as tmp:
+        engine = os.path.join(tmp, "invalid-output.py")
+        with open(engine, "w") as f:
+            f.write("#!" + sys.executable + "\n")
+            f.write("import sys\n")
+            f.write("sys.stdin.read()\n")
+            f.write("sys.stdout.buffer.write(b'answer: \\xff\\n')\n")
+        os.chmod(engine, os.stat(engine).st_mode | stat.S_IEXEC | stat.S_IRWXU)
+
+        review = fresh_review()
+        review.CLAUDE_CMD = [engine]
+        assert review.run_engine("claude", "prompt", tmp) == "answer: �\n"
+
+        review.SELECT_CMD = [engine]
+        selection = review.select_files_to_inline(
+            [("file.py", "diff --git a/file.py b/file.py\n")],
+            "file.py | 1 +\n", "(none found)", tmp,
+        )
+        assert selection.status == "unparsed", selection.status
+        assert "�" in selection.detail, selection.detail
+    print("ok 12. finder and selection engines replace undecodable output bytes")
+
+
+def test_undecodable_chunks_are_disclosed_but_never_inlined():
+    with scratch_dir() as tmp:
+        wt, base = make_undecodable_tree(tmp)
+        trap = os.path.join(tmp, "selection-must-not-run.py")
+        marker = os.path.join(tmp, "selection-ran")
+        with open(trap, "w") as f:
+            f.write("#!" + sys.executable + "\n")
+            f.write("from pathlib import Path\n")
+            f.write(f"Path({marker!r}).write_text('called')\n")
+        os.chmod(trap, os.stat(trap).st_mode | stat.S_IEXEC | stat.S_IRWXU)
+
+        review = fresh_review()
+        review.SELECT_CMD = [trap]
+        review.DIFF_INLINE_CAP = 100000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+
+        assert not os.path.exists(marker), "an under-cap diff must not invoke selection"
+        assert mode.kind == "partial" and mode.undecodable_files == 1, mode
+        assert (mode.inlined_files, mode.total_files) == (1, 2), mode
+        assert mode.footer_word == "partial 1/2 files, 1 undecodable", mode.footer_word
+        expected_journal = (
+            f"1 of 2 files inlined, {mode.inlined_chars} of {mode.total_chars} chars, "
+            "1 not valid UTF-8 (selection disabled: under cap)"
+        )
+        assert mode.journal_phrase == expected_journal, mode.journal_phrase
+        assert "ordinary.py" in block and "print('readable')" in block, block
+        assert "�" not in block, "replacement-character diff content must not be inlined"
+        assert (
+            "- `examples.db` (not valid UTF-8 — not readable as text)" in block
+        ), block
+        assert "some files are not valid UTF-8" in block, block
+        assert expected_journal in err.getvalue(), err.getvalue()
+
+        selected = review.DiffMode(
+            "partial", 1, 2, mode.inlined_chars, mode.total_chars,
+            selection=review.Selection("ok", ranked=["ordinary.py"]),
+            undecodable_files=1,
+        )
+        assert selected.footer_word == "partial 1/2 files, selected, 1 undecodable"
+        assert selected.journal_phrase.endswith(
+            ", 1 not valid UTF-8 (selection ranked 1: ordinary.py)"
+        ), selected.journal_phrase
+
+    with scratch_dir() as tmp:
+        wt, base = make_undecodable_tree(tmp, include_source=False)
+        review = fresh_review()
+        review.DIFF_INLINE_CAP = 100000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+        assert mode.kind == "file-list" and mode.inlined_files == 0, mode
+        assert mode.footer_word == "file-list, 1 undecodable", mode.footer_word
+        assert mode.journal_phrase == "file-list only, 1 not valid UTF-8"
+        assert "```diff" not in block and "�" not in block, block
+        assert "diff is not valid UTF-8" in block, block
+        assert "- `examples.db` (not valid UTF-8 — not readable as text)" in block
+        assert "file-list only, 1 not valid UTF-8" in err.getvalue(), err.getvalue()
+    print("ok 13. undecodable chunks are marked and excluded, including all-undecodable input")
+
+
+def test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte():
+    with scratch_dir() as tmp:
+        baseline_path = os.path.join(tmp, "review-f3f7611.py")
+        baseline_source = _git(REPO_ROOT, "show", "f3f7611:review.py")
+        with open(baseline_path, "w") as f:
+            f.write(baseline_source)
+        baseline = fresh_review(baseline_path, "review_diff_packing_baseline")
+        current = fresh_review(name="review_diff_packing_current")
+
+        wt, base = make_multi_file_tree(tmp, [800, 300, 800, 300])
+        total = len(diff_text(wt, base))
+        selector = os.path.join(tmp, "selector.py")
+        with open(selector, "w") as f:
+            f.write("import json, sys\n")
+            f.write("sys.stdin.read()\n")
+            f.write("print(json.dumps({'files': ['file3.txt', 'file2.txt', "
+                    "'file1.txt', 'file0.txt']}))\n")
+
+        cases = [
+            ("inlined", total, [], False),
+            ("partial", total - 1, [], False),
+            ("partial selected", total - 1, [sys.executable, selector], True),
+            ("file-list", 1, [], False),
+        ]
+        for label, cap, select_cmd, expect_selected in cases:
+            observed = []
+            for review in (baseline, current):
+                review.DIFF_INLINE_CAP = cap
+                review.SELECT_CMD = list(select_cmd)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+                observed.append((block, mode.footer_word, mode.journal_phrase))
+                assert mode.selected is expect_selected, (label, mode)
+            assert observed[1] == observed[0], (
+                f"{label} output changed from f3f7611:\n"
+                f"baseline={observed[0]!r}\ncurrent={observed[1]!r}"
+            )
+    print("ok 14. zero-undecodable prompt/footer/journal bytes match f3f7611 in all modes")
+
+
+def test_literal_replacement_char_is_not_undecodable():
+    """A valid UTF-8 file containing U+FFFD must stay inlinable.
+
+    A U+FFFD sentinel cannot tell that file apart from one carrying undecodable bytes,
+    so it would drop it from the finder's prompt under a marker asserting — falsely —
+    that it is not readable as text. review.py is exactly such a file, so the sentinel
+    version of this feature blinded the finder to its own implementation.
+    """
+    with scratch_dir() as tmp:
+        wt = os.path.join(tmp, "mixed-worktree")
+        os.makedirs(wt)
+        subprocess.run([GIT, "init", "-q", wt], check=True)
+        _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
+        base = _git(wt, "rev-parse", "HEAD").strip()
+        # Valid UTF-8 that happens to contain the replacement character, the way any
+        # code testing for it does.
+        with open(os.path.join(wt, "sentinel.py"), "w", encoding="utf-8") as f:
+            f.write('MARKER = "�"  # a literal replacement character\n')
+        with open(os.path.join(wt, "examples.db"), "wb") as f:
+            f.write(b"caf\xe9 latin-1 line\n" * 40)
+        _git(wt, "add", ".")
+        _git(wt, *GIT_ID, "commit", "-qm", "sentinel plus genuinely undecodable file")
+
+        review = fresh_review()
+        review.SELECT_CMD = []
+        review.DIFF_INLINE_CAP = 100000
+        with contextlib.redirect_stderr(io.StringIO()):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+
+        assert mode.undecodable_files == 1, mode
+        assert (mode.inlined_files, mode.total_files) == (1, 2), mode
+        assert "MARKER" in block, "a valid UTF-8 file must be inlined, U+FFFD or not"
+        assert "- `sentinel.py`" not in block, block
+        assert "- `examples.db` (not valid UTF-8 — not readable as text)" in block, block
+    print("ok 15. a literal U+FFFD in valid UTF-8 is not mistaken for undecodable bytes")
+
+
+def test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character():
+    """The classifier keys on lone surrogates, which valid UTF-8 can never produce.
+
+    Also a standing guard on this repo's own sources: any tracked file containing a
+    literal U+FFFD must stay inlinable, or the finder goes blind to it — silently, on
+    every future PR that touches it.
+    """
+    review = fresh_review()
+    assert not review.has_undecodable_bytes("plain ascii\n")
+    # The whole point: a literal U+FFFD is ordinary valid text, not a decode failure.
+    assert not review.has_undecodable_bytes('MARKER = "�"\n')
+    assert review.has_undecodable_bytes(b"caf\xe9\n".decode("utf-8", "surrogateescape"))
+
+    checked = 0
+    for rel in ("review.py", "client.py", "serve.py", "tests/test_diff_packing.py"):
+        with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as f:
+            source = f.read()
+        if "�" not in source:
+            continue
+        checked += 1
+        assert not review.has_undecodable_bytes(source), (
+            f"{rel} classified as undecodable — the finder would never see this file"
+        )
+    assert checked, "guard is vacuous: no tracked source carries a literal U+FFFD"
+    print("ok 16. undecodability keys on bytes, so a literal U+FFFD stays inlinable")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -516,6 +739,12 @@ TESTS = [
     test_empty_result_on_partial_input_end_to_end,
     test_replays_the_org_gtd_cli_52_case,
     test_handles_renames_deletions_modes_binaries_and_odd_names,
+    test_git_replaces_undecodable_diff_bytes,
+    test_engines_replace_undecodable_output_bytes,
+    test_undecodable_chunks_are_disclosed_but_never_inlined,
+    test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte,
+    test_literal_replacement_char_is_not_undecodable,
+    test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character,
 ]
 
 

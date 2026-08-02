@@ -219,14 +219,22 @@ A PR review feeds the finder as much of the diff as `REVIEW_BOT_DIFF_CAP`
 hunks go in if they fit in the remaining budget, and a file that does not fit is
 skipped — later, smaller files still get their chance. The order is the diff's
 own, unless the diff is over the cap and the selection stage below ranked it.
+Git output is decoded leniently, so a file that is binary-as-text (NUL-free, and
+therefore diffed as text) can no longer kill a review. The diff itself is decoded
+with `surrogateescape`, which leaves every undecodable byte as a lone surrogate in
+U+DC80–U+DCFF — a range valid UTF-8 can never produce. A per-file chunk carrying
+one is treated as undecodable: excluded from both selection and packing, and
+marked by name instead of sending garbage to the finder. The test is exact, not a
+heuristic — a file that merely *contains* a literal U+FFFD stays inlinable, which
+matters because `review.py` is such a file.
 That yields three input modes, and how much the finder was shown changes what it
 can find, so the mode is disclosed rather than inferred:
 
 | mode | what the prompt carries |
 | --- | --- |
-| `inlined` | every file's hunks |
-| `partial k/n files` | k whole files' hunks, plus the names of the other n−k (`, selected` when a ranking chose which k) |
-| `file-list` | no hunks at all — `git diff --stat` and the instruction to read the checkout |
+| `inlined` | every file's hunks; this mode therefore has no undecodable files |
+| `partial k/n files` | k whole, decodable files' hunks, plus the names of the other n−k (`, selected` when a ranking chose which k; `, u undecodable` when u files were not valid UTF-8) |
+| `file-list` | no hunks at all — `git diff --stat` and the instruction to read the checkout (`, u undecodable` when applicable) |
 
 - a journal line, emitted before the **finder** runs — on an over-cap diff the selection
   stage has already run and logged its own `selecting inline order over N files …` line
@@ -234,17 +242,29 @@ can find, so the mode is disclosed rather than inferred:
   `review-bot-review: diff 208564 chars vs cap 60000 — 3 of 9 files inlined, 57204 of 208564 chars (selection ranked 3: …)`
   (the other two wordings are `— inlined` and `— file-list only`). A `partial` line
   **always** carries a `(selection …)` suffix; it reads `(selection disabled)` when the
-  stage was off, `(selection disabled: dry run)` under `--dry-run`, and
-  `(selection failed: …)` when it degraded;
+  stage was off, `(selection disabled: under cap)` when an under-cap diff is partial
+  only because it has an undecodable file, `(selection disabled: dry run)` under
+  `--dry-run`, and `(selection failed: …)` when it degraded. With undecodable files,
+  a `, u not valid UTF-8` clause appears before that suffix (or after `file-list only`),
+  for example `— 6 of 7 files inlined, 41203 of 98211 chars, 1 not valid UTF-8
+  (selection disabled: under cap)` (that branch packs nothing, so `inlined` there is
+  always `total` minus the undecodable count);
 - a review footer segment directly after `findings` and before `merge-base`:
   ``diff `inlined` ``, ``diff `partial 3/9 files` `` (``diff `partial 3/9 files, selected` ``
-  when a ranking chose which k) or ``diff `file-list` ``.
+  when a ranking chose which k) or ``diff `file-list` ``. The undecodable count follows
+  either existing suffix: for example, ``diff `partial 5/7 files, selected, 1 undecodable` ``
+  or ``diff `file-list, 2 undecodable` ``.
+
+An undecodable entry in the not-inlined list is emitted exactly as
+``- `path/to/file` (not valid UTF-8 — not readable as text)``. Files omitted only
+because of the cap keep the unmarked ``- `path/to/file` `` form.
 
 Whole files only: a half-diff is worse input than an honest omission, and the
-engine cannot tell the two apart unless it is told. When not even one file fits
-(a single file larger than the whole cap), the review degrades to `file-list`
-rather than emit a truncated file. The cap governs diff *content*; the `--stat`
-header and the surrounding prose are not counted against it.
+engine cannot tell the two apart unless it is told. When not even one file can be
+inlined (a single decodable file larger than the whole cap, or every file being
+undecodable), the review degrades to `file-list` rather than emit a truncated file
+or undecodable text. The cap governs diff *content*; the `--stat` header and the
+surrounding prose are not counted against it.
 
 All three disclosures come from the one `DiffMode` `changed_files_block` returns
 after packing — a diff of exactly the cap is still fully inlined — so the
@@ -264,8 +284,10 @@ and only when the diff is over the cap**, a deliberately cheap engine ranks the
 files first (`REVIEW_BOT_SELECT_CMD`, default
 `claude -p --output-format json --model haiku`; empty disables the stage). It is
 handed metadata only — `--stat`, each file's diff header and its `@@` hunk
-headers, and the repo's convention files — never hunk bodies, and it returns a
-ranked list of paths with a one-clause reason each.
+headers for inlinable files, and the repo's convention files — never hunk bodies,
+and it returns a ranked list of paths with a one-clause reason each. Undecodable
+chunks are removed before this stage, so they cannot consume ranking or inline
+budget.
 
 The ranking decides **order, never scope**:
 
@@ -279,6 +301,10 @@ The ranking decides **order, never scope**:
   duplicate collapses, a reason is flattened to one clipped line, and nothing
   else in the object is read. There is no path by which a ranking becomes a
   finding.
+
+An under-cap diff never runs this engine. If an undecodable file makes such a diff
+`partial`, the journal's required selection suffix records
+`(selection disabled: under cap)`.
 
 Every failure — the stage disabled, the binary missing, a non-zero exit, a
 timeout, unparseable output, an empty or entirely hallucinated list — degrades to

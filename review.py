@@ -311,13 +311,22 @@ class GitAuth:
         self._dir.cleanup()
 
 
-def git(args, cwd, auth, check=True, capture=True):
+def git(args, cwd, auth, check=True, capture=True, errors="replace"):
+    """Run git, decoding its output leniently so undecodable bytes cannot kill a review.
+
+    `errors` defaults to `replace`: callers that only read git's output as prose want
+    U+FFFD and nothing surrogate-shaped leaking into a prompt. The diff call overrides it
+    to `surrogateescape` because it needs to tell "bytes git could not decode" apart from
+    "this file genuinely contains U+FFFD" — see `has_undecodable_bytes`.
+    """
     proc = subprocess.run(
         [GIT, *args],
         cwd=cwd,
         env=auth.env(),
         capture_output=capture,
         text=True,
+        encoding="utf-8",
+        errors=errors,
     )
     if check and proc.returncode != 0:
         die(f"git {' '.join(args)} failed (rc={proc.returncode}):\n{proc.stderr}")
@@ -651,16 +660,21 @@ class DiffMode:
     `selection` (issue #35) records whether the cheap ranking stage decided the packing
     ORDER. It never decides scope — an unranked file is packed after the ranked ones and,
     if it still does not fit, it is listed exactly as it would have been anyway.
+
+    `undecodable_files` counts chunks whose diff text carries bytes that are not valid
+    UTF-8 (`has_undecodable_bytes`). Those chunks are named and disclosed, but never sent
+    to either engine. A file that merely contains a literal U+FFFD is NOT one of them.
     """
 
     def __init__(self, kind, inlined_files, total_files, inlined_chars, total_chars,
-                 selection=None):
+                 selection=None, undecodable_files=0):
         self.kind = kind
         self.inlined_files = inlined_files
         self.total_files = total_files
         self.inlined_chars = inlined_chars
         self.total_chars = total_chars
         self.selection = selection
+        self.undecodable_files = undecodable_files
 
     @property
     def fully_inlined(self):
@@ -683,8 +697,13 @@ class DiffMode:
         """
         if self.kind == "partial":
             word = f"partial {self.inlined_files}/{self.total_files} files"
-            return f"{word}, selected" if self.selected else word
-        return self.kind
+            if self.selected:
+                word += ", selected"
+        else:
+            word = self.kind
+        if self.undecodable_files:
+            word += f", {self.undecodable_files} undecodable"
+        return word
 
     @property
     def journal_phrase(self):
@@ -695,12 +714,17 @@ class DiffMode:
                 f"{self.inlined_files} of {self.total_files} files inlined, "
                 f"{self.inlined_chars} of {self.total_chars} chars"
             )
+            if self.undecodable_files:
+                phrase += f", {self.undecodable_files} not valid UTF-8"
             if self.selection:
                 phrase += f" ({self.selection.journal_phrase})"
             return phrase
         if self.kind == "inlined":
             return "inlined"
-        return "file-list only"
+        phrase = "file-list only"
+        if self.undecodable_files:
+            phrase += f", {self.undecodable_files} not valid UTF-8"
+        return phrase
 
     def __repr__(self):
         return (
@@ -740,6 +764,33 @@ class Selection:
 
     def __repr__(self):
         return f"Selection({self.status!r}, {len(self.ranked)} ranked)"
+
+
+def has_undecodable_bytes(text):
+    """True when `text` carries bytes git handed us that are not valid UTF-8.
+
+    The diff is decoded with `surrogateescape`, so each undecodable byte survives as a
+    lone surrogate in U+DC80–U+DCFF — a range that CANNOT appear in text decoded from
+    valid UTF-8, which makes this test exact rather than heuristic.
+
+    A U+FFFD sentinel would not be: `errors="replace"` maps an undecodable byte and a
+    literal U+FFFD in the source to the same character, so a perfectly valid UTF-8 file
+    containing one would be excluded from the finder's prompt under a marker asserting,
+    falsely, that it is not readable as text. That is not hypothetical — the two lines
+    below this docstring would have done it to `review.py` itself, permanently blinding
+    the finder to this file on every future PR.
+    """
+    return any("\udc80" <= ch <= "\udcff" for ch in text)
+
+
+def to_display_text(text):
+    """Fold surrogate-escaped bytes back to U+FFFD so a string is safe to encode.
+
+    Only paths reach this: an undecodable file's hunks never enter a prompt, and every
+    inlined chunk is surrogate-free by construction. It exists so a non-UTF-8 *filename*
+    cannot raise `UnicodeEncodeError` on its way into the not-inlined list.
+    """
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 def split_diff_by_file(diff):
@@ -895,6 +946,7 @@ def select_files_to_inline(chunks, stat, conv_str, cwd, dry_run=False):
     try:
         proc = subprocess.run(
             SELECT_CMD, input=prompt, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=SELECT_TIMEOUT,
         )
     except FileNotFoundError:
@@ -960,7 +1012,10 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
     """
     # The cache clone is checked out detached at the PR head, so HEAD is the head.
     stat = git(["diff", "--stat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
-    diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
+    # surrogateescape, not replace: only this call needs to distinguish undecodable
+    # bytes from a literal U+FFFD in the source (see has_undecodable_bytes).
+    diff = git(["diff", f"{merge_base}..HEAD"], cwd=cdir, auth=auth,
+               errors="surrogateescape").stdout
     numstat = git(["diff", "--numstat", f"{merge_base}..HEAD"], cwd=cdir, auth=auth).stdout
     files = insertions = deletions = 0
     for line in numstat.splitlines():
@@ -973,21 +1028,32 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
         deletions += int(parts[1]) if parts[1].isdigit() else 0
     stats = {"files": files, "insertions": insertions, "deletions": deletions}
     chunks = split_diff_by_file(diff)
+    inlinable = [(path, text) for path, text in chunks if not has_undecodable_bytes(text)]
+    undecodable = [(path, text) for path, text in chunks if has_undecodable_bytes(text)]
     selection = None
-    if len(diff) <= DIFF_INLINE_CAP:
-        kept, elided = chunks, []
+    if not undecodable and len(diff) <= DIFF_INLINE_CAP:
+        kept, elided = inlinable, []
         kind = "inlined"
+    elif len(diff) <= DIFF_INLINE_CAP:
+        # Preserve the under-cap no-engine contract even though the mode is partial:
+        # the explicit Selection keeps the journal's always-a-suffix invariant honest.
+        selection = Selection("disabled", detail="under cap")
+        kept, elided = inlinable, undecodable
+        kind = "partial" if kept else "file-list"
     else:
         # Only over the cap: an under-cap review runs no extra engine and its footer is
         # byte-identical to a pre-#35 one. The ranking is asked for BEFORE packing, since
         # all it does is choose which files the packer sees first.
-        selection = select_files_to_inline(chunks, stat, conv_str, cdir, dry_run=dry_run)
-        kept, elided = pack_diff_chunks(apply_selection(chunks, selection.ranked),
-                                        DIFF_INLINE_CAP)
-        # Nothing fit — a single file bigger than the whole cap. Degrade to the pre-#34
-        # file-list-only block rather than emit half of one file's hunks: a truncated
-        # diff is worse input than an honest omission, and the engine cannot tell the
-        # two apart unless it is told.
+        selection = select_files_to_inline(
+            inlinable, stat, conv_str, cdir, dry_run=dry_run
+        )
+        kept, elided = pack_diff_chunks(
+            apply_selection(inlinable, selection.ranked), DIFF_INLINE_CAP
+        )
+        elided += undecodable
+        # Nothing fit — either every inlinable file exceeds the cap, or every chunk is
+        # undecodable. Degrade to a file-list-only block rather than emit half of one
+        # file's hunks or replacement-character garbage.
         kind = "partial" if kept else "file-list"
     mode = DiffMode(
         kind,
@@ -996,6 +1062,7 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
         inlined_chars=sum(len(t) for _, t in kept),
         total_chars=len(diff),
         selection=selection,
+        undecodable_files=len(undecodable),
     )
     # The measurement is logged BEFORE the empty-diff refusal below, not after: a 0-char
     # diff is exactly the case tools/finder_ab.py needs the number for, since `0 <= cap`
@@ -1010,16 +1077,32 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
         )
     if mode.fully_inlined:
         return f"{stat}\n```diff\n{diff}\n```", mode, stats
+    listed = "\n".join(
+        f"- `{to_display_text(path)}`" + (
+            " (not valid UTF-8 — not readable as text)"
+            if has_undecodable_bytes(text) else ""
+        )
+        for path, text in elided
+    )
+    n_out = len(elided)
     if kind == "file-list":
+        reason = (
+            "diff is large" if len(diff) > DIFF_INLINE_CAP
+            else "diff is not valid UTF-8"
+        )
+        undecodable_list = ""
+        if undecodable:
+            undecodable_list = (
+                f"\n\nNot inlined ({n_out} file{'s' if n_out != 1 else ''}) — read from "
+                f"the checkout before judging:\n{listed}"
+            )
         return (
-            f"{stat}\n\n(diff is large — only the file list is inlined. The repo is "
+            f"{stat}\n\n({reason} — only the file list is inlined. The repo is "
             f"checked out at the PR head; run `git diff {merge_base[:12]}..HEAD -- "
-            f"<file>` to inspect specific hunks.)",
+            f"<file>` to inspect specific hunks.){undecodable_list}",
             mode,
             stats,
         )
-    listed = "\n".join(f"- `{path}`" for path, _ in elided)
-    n_out = len(elided)
     plural = "s are" if n_out != 1 else " is"
     # Say when the order is a triage pass's rather than the diff's own, so the finder
     # does not read the sequence as git's. It is a hint about ordering and nothing more:
@@ -1029,8 +1112,12 @@ def changed_files_block(cdir, merge_base, auth, conv_str="(none found)", dry_run
         " (ordered by a cheap triage pass, most worth reading first)"
         if mode.selected else ""
     )
+    reason = (
+        "diff is large" if len(diff) > DIFF_INLINE_CAP
+        else "some files are not valid UTF-8"
+    )
     return (
-        f"{stat}\n\n(diff is large — {mode.inlined_files} of {mode.total_files} files "
+        f"{stat}\n\n({reason} — {mode.inlined_files} of {mode.total_files} files "
         f"are inlined in full below{order}; the other {n_out} file{plural} listed after "
         f"them, with no hunks. The repo is checked out at the PR head; run "
         f"`git diff {merge_base[:12]}..HEAD -- <file>` to read them.)\n"
@@ -1144,7 +1231,8 @@ def run_engine(harness, prompt, cwd, dry_run=False):
     log(f"running {harness} ({cmd[0]}) in {cwd} …")
     try:
         proc = subprocess.run(
-            cmd, input=prompt, cwd=cwd, capture_output=True, text=True, timeout=ENGINE_TIMEOUT
+            cmd, input=prompt, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=ENGINE_TIMEOUT
         )
     except FileNotFoundError:
         die(f"harness binary not found: {cmd[0]} (is {harness} on PATH?)")
