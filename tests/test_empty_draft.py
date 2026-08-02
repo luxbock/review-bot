@@ -773,6 +773,45 @@ def test_normalize_report_stays_coupled_to_normalized_results():
     print("ok 19. normalize reports stay coupled to every normalized result")
 
 
+def test_journal_never_calls_a_printed_verdict_absent():
+    """The note distinguishes all three verdict states, from the report and from a
+    pre-report journal alike. Folding `unrecognised` into the absent note made the line
+    say `verdict 'approve|comment|request_changes' (ABSENT — defaulted)` — asserting
+    absence about a value printed in the same breath, which is the class of unsupported
+    claim this whole diagnostic exists to prevent."""
+    review = fresh_review()
+
+    def note_for(raw_verdict, verdict_present, with_report):
+        parse = {"path": "envelope-result", "keys": ["verdict"],
+                 "verdict_present": verdict_present, "verdict_raw": raw_verdict,
+                 "findings_kind": "missing", "findings_len": None}
+        if with_report:
+            report = {}
+            obj = {"verdict": raw_verdict} if verdict_present else {}
+            review.normalize(obj, report)
+            parse["normalize_report"] = report
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            review.log_empty_finder_diagnostic("claude", {"mode": "pr", "parse": parse})
+        line = next(l for l in err.getvalue().splitlines() if "EMPTY FINDER" in l)
+        return line[line.index("verdict "):line.index(", findings")]
+
+    for with_report in (True, False):
+        where = "report" if with_report else "legacy"
+        recognised = note_for("approve", True, with_report)
+        assert recognised == "verdict 'approve' (present)", (where, recognised)
+        # The quoted schema an engine echoes back: present, not an answer, and the note
+        # must not claim it was absent while quoting it.
+        echoed = note_for("approve|comment|request_changes", True, with_report)
+        assert echoed == (
+            "verdict 'approve|comment|request_changes' "
+            "(present but unrecognised — defaulted)"
+        ), (where, echoed)
+        assert "ABSENT" not in echoed, (where, echoed)
+        missing = note_for(None, False, with_report)
+        assert missing == "verdict None (ABSENT — defaulted)", (where, missing)
+
+
 def main():
     tests = [
         test_empty_pr_skips_verify_and_discloses,
@@ -794,6 +833,7 @@ def main():
         test_genuine_check_is_mode_aware,
         test_disclosure_tiers_follow_diff_size,
         test_normalize_report_stays_coupled_to_normalized_results,
+        test_journal_never_calls_a_printed_verdict_absent,
     ]
     for test in tests:
         test()

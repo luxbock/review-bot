@@ -1619,9 +1619,16 @@ def log_empty_finder_diagnostic(harness, diag):
             verdict_source = (
                 "engine"
                 if parse.get("verdict_raw") in VERDICT_LABEL
+                else "unrecognised" if parse.get("verdict_present")
                 else "absent"
             )
-        verdict_note = "present" if verdict_source == "engine" else "ABSENT — defaulted"
+        # Three states, three notes. Folding `unrecognised` into the absent note would
+        # assert absence about a value printed in the same line — the exact class of
+        # unsupported claim this diagnostic exists to prevent.
+        verdict_note = {
+            "engine": "present",
+            "unrecognised": "present but unrecognised — defaulted",
+        }.get(verdict_source, "ABSENT — defaulted")
     retry = " after a JSON-repair retry;" if diag.get("repair_retried") else ";"
     log(
         f"EMPTY FINDER ({harness}, {mode} mode): {call}. Zero drafts{retry} "
