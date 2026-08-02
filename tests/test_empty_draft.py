@@ -810,6 +810,7 @@ def test_journal_never_calls_a_printed_verdict_absent():
         assert "ABSENT" not in echoed, (where, echoed)
         missing = note_for(None, False, with_report)
         assert missing == "verdict None (ABSENT — defaulted)", (where, missing)
+    print("ok 20. the verdict note distinguishes present, unrecognised and absent")
 
 
 def main():
