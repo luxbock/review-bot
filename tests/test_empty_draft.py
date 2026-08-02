@@ -680,6 +680,99 @@ def test_raw_excerpt_clips_head_and_tail():
     print("ok 12. raw excerpt keeps both ends and states how much it dropped")
 
 
+def test_normalize_report_stays_coupled_to_normalized_results():
+    """Every default and discard reported by normalize* must agree with its output."""
+    review = fresh_review()
+
+    class FindingLike:
+        """Non-dict with the methods normalization would use if its guard drifted."""
+
+        def get(self, _key, default=None):
+            return default
+
+    rows = [
+        ("review empty", review.normalize, "pr", {"verdict": "approve", "findings": []}),
+        ("review null", review.normalize, "pr", {"verdict": "approve", "findings": None}),
+        ("review verdict only", review.normalize, "pr", {"verdict": "approve"}),
+        ("review schema echo", review.normalize, "pr", {
+            "verdict": "approve|comment|request_changes",
+        }),
+        ("review two findings", review.normalize, "pr", {"findings": [{}, {}]}),
+        ("review mapping-like non-dict", review.normalize, "pr", {
+            "findings": [FindingLike()],
+        }),
+        ("review discarded", review.normalize, "pr", {"findings": [1, "bad"]}),
+        ("review mixed", review.normalize, "pr", {"findings": [{}, None]}),
+        ("review dict findings", review.normalize, "pr", {"findings": {}}),
+        ("review string findings", review.normalize, "pr", {"findings": ""}),
+        ("review integer findings", review.normalize, "pr", {"findings": 0}),
+        ("audit empty", review.normalize_audit, "repo", {"findings": []}),
+        ("audit mixed", review.normalize_audit, "repo", {"findings": [{}, False]}),
+        ("triage engine", review.normalize_triage, "issue", {
+            "disposition": "genuine-bug",
+        }),
+        ("triage absent", review.normalize_triage, "issue", {"summary": "unclear"}),
+        ("triage unrecognised", review.normalize_triage, "issue", {
+            "disposition": "probably-fine",
+        }),
+    ]
+    report_fields = {
+        "schema", "schema_has_verdict", "findings_source", "findings_received",
+        "findings_discarded", "verdict_source", "disposition_source",
+    }
+
+    def findings_source(raw):
+        if "findings" not in raw:
+            return "absent"
+        value = raw["findings"]
+        if value is None:
+            return "null"
+        if isinstance(value, list):
+            return "list"
+        return f"non-list:{type(value).__name__}"
+
+    for name, norm, mode, raw in rows:
+        report = {}
+        result = norm(raw, report)
+        assert set(report) == report_fields, (name, report)
+        expected_source = "n/a" if mode == "issue" else findings_source(raw)
+        assert report["findings_source"] == expected_source, (name, report)
+        if report["findings_source"] == "list":
+            assert report["findings_received"] == len(raw["findings"]), (name, report)
+            assert report["findings_discarded"] == (
+                report["findings_received"] - len(result["findings"])
+            ), (name, report, result)
+        else:
+            assert report["findings_received"] is None, (name, report)
+
+        if mode == "pr":
+            engine_verdict_survived = (
+                "verdict" in raw and result["verdict"] == raw["verdict"]
+            )
+            assert (report["verdict_source"] == "engine") == engine_verdict_survived, (
+                name, report, result,
+            )
+        else:
+            assert report["verdict_source"] == "n/a", (name, report)
+
+        if mode == "issue":
+            engine_disposition_survived = (
+                "disposition" in raw and result["disposition"] == raw["disposition"]
+            )
+            assert (
+                report["disposition_source"] == "engine"
+            ) == engine_disposition_survived, (name, report, result)
+        else:
+            assert report["disposition_source"] == "n/a", (name, report)
+
+        legacy_parse = review._describe_parsed(raw, "coupling-table")
+        report_parse = dict(legacy_parse, normalize_report=report)
+        assert review.empty_finder_is_genuine(report_parse, mode) == (
+            review.empty_finder_is_genuine(legacy_parse, mode)
+        ), (name, legacy_parse, report)
+    print("ok 19. normalize reports stay coupled to every normalized result")
+
+
 def main():
     tests = [
         test_empty_pr_skips_verify_and_discloses,
@@ -700,6 +793,7 @@ def main():
         test_disposition_defaulted_at_the_verify_stage_is_journalled,
         test_genuine_check_is_mode_aware,
         test_disclosure_tiers_follow_diff_size,
+        test_normalize_report_stays_coupled_to_normalized_results,
     ]
     for test in tests:
         test()

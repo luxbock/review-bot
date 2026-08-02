@@ -1297,11 +1297,15 @@ def normalize(obj, report=None):
         disposition_source="n/a",
     )
     verdict = obj.get("verdict", "comment")
-    if verdict not in VERDICT_LABEL:
-        verdict_source = "absent" if "verdict" not in obj else "unrecognised"
-        verdict = "comment"
+    verdict_recognised = verdict in VERDICT_LABEL
+    if "verdict" not in obj:
+        verdict_source = "absent"
+    elif not verdict_recognised:
+        verdict_source = "unrecognised"
     else:
         verdict_source = "engine"
+    if not verdict_recognised:
+        verdict = "comment"
     _fill_diag(report, verdict_source=verdict_source)
 
     if "findings" not in obj:
@@ -1360,11 +1364,15 @@ def normalize_triage(obj, report=None):
         verdict_source="n/a",
     )
     disp = obj.get("disposition", "needs-info")
-    if disp not in DISPOSITIONS:
-        disposition_source = "absent" if "disposition" not in obj else "unrecognised"
-        disp = "needs-info"
+    disposition_recognised = disp in DISPOSITIONS
+    if "disposition" not in obj:
+        disposition_source = "absent"
+    elif not disposition_recognised:
+        disposition_source = "unrecognised"
     else:
         disposition_source = "engine"
+    if not disposition_recognised:
+        disp = "needs-info"
     _fill_diag(report, disposition_source=disposition_source)
     conf = obj.get("confidence", "medium")
     if conf not in ("high", "medium", "low"):
