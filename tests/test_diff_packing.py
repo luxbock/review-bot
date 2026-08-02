@@ -833,6 +833,18 @@ def test_default_cap_matches_the_deployed_service_and_the_readme():
     assert cap == DEPLOYED_DIFF_CAP, cap
     assert total > cap, (total, cap)
     assert inlined_files < all_files, (inlined_files, all_files)
+
+    # The OTHER example — the undecodable-file branch — asserts `selection disabled:
+    # under cap` about its own size, so that size must actually be under the cap. At the
+    # old 60000 default it was not (98211 > 60000): the example claimed "under cap" for
+    # an over-cap diff, and raising the default to 250000 fixed it by ACCIDENT. Pin it,
+    # or the next cap change silently re-breaks the same sentence.
+    under = re.search(r"— \d+ of \d+ files inlined, (\d+) of (\d+) chars, \d+ not valid"
+                      r" UTF-8\n\s*\(selection disabled: under cap\)", readme)
+    assert under, "README's under-cap undecodable example is gone or reshaped"
+    under_inlined, under_total = (int(g) for g in under.groups())
+    assert under_total < DEPLOYED_DIFF_CAP, (under_total, DEPLOYED_DIFF_CAP)
+    assert under_inlined < under_total, (under_inlined, under_total)
     print(f"ok 17. the default cap, the deployed unit and the README all say "
           f"{DEPLOYED_DIFF_CAP}")
 
