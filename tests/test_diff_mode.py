@@ -660,6 +660,25 @@ def test_finder_ab_stores_the_empty_finder_diagnostic():
     described_discarded = mod.describe_empty_diag(audit_discarded)
     assert described_discarded.startswith("DEFAULTED"), described_discarded
     assert "list of 2 — every entry discarded by normalize" in described_discarded, described_discarded
+    # A current journal carries normalize*'s report and review.py's conclusion. Make the
+    # old raw facts deliberately say "genuine" so this arm proves the tool prefers that
+    # conclusion instead of silently continuing to re-derive it.
+    report_carrying = {"empty_finder_diag": {
+        "mode": "pr", "empty_finder_is_genuine": False,
+        "parse": {
+            "findings_kind": "list", "findings_len": 0,
+            "verdict_present": True, "verdict_raw": "approve",
+            "path": "envelope-result", "keys": ["findings", "verdict"],
+            "normalize_report": {
+                "schema": "review", "schema_has_verdict": True,
+                "findings_source": "list", "findings_received": 1,
+                "findings_discarded": 1, "verdict_source": "engine",
+                "disposition_source": "n/a",
+            },
+        },
+    }}
+    described_report = mod.describe_empty_diag(report_carrying)
+    assert described_report.startswith("DEFAULTED"), described_report
     print("ok 11. finder_ab: empty runs keep the reviewer's diagnostic and are classified")
 
 
