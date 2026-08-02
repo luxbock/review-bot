@@ -32,7 +32,8 @@ checkout:
 
     python3 tools/finder_ab.py --owner olli --repo review-bot --pr 23 --runs 5
 
-By default it builds the package with nix-build and uses
+By default it builds the package with `nix build .#default` (the repo's own flake, so
+both arms come from the nixpkgs pinned in flake.lock) and uses
 `$out/bin/review-bot-review-local`; `--binary PATH` overrides that (this is also how
 the tests drive it against a stub).
 
@@ -65,7 +66,12 @@ HARNESSES = ("claude", "codex")
 # The two forced input modes, as (label, REVIEW_BOT_DIFF_CAP value).
 INPUT_MODES = (("forced-inline", 100000000), ("forced-elide", 1))
 
-NIX_EXPR = "with import <nixpkgs> {}; callPackage ./default.nix {}"
+# The repo's own flake, so the binary under test is built from the pinned nixpkgs in
+# flake.lock rather than whatever ambient NIX_PATH channel `<nixpkgs>` resolves to. An
+# A/B harness whose two arms could be built against different package sets is not an
+# A/B harness; the previous `--expr 'with import <nixpkgs> {}; …'` form also warned
+# inside a factory VM, where a channel may not be configured at all.
+NIX_BUILD_CMD = ["nix", "build", ".#default", "--no-link", "--print-out-paths"]
 
 # Footer segments rendered by review.py's render_markdown.
 VERDICT_RE = re.compile(r"^## 🤖 review-bot — (.+)$", re.MULTILINE)
@@ -136,16 +142,16 @@ def pr_head_sha(owner, repo, pr, token):
 
 # ── the binary under test ──────────────────────────────────────────────────────
 def build_binary():
-    """nix-build the package and return $out/bin/review-bot-review-local."""
-    log("building the package (nix-build) …")
+    """Build the package from the repo's flake; return $out/bin/review-bot-review-local."""
+    log("building the package (nix build .#default) …")
     proc = subprocess.run(
-        ["nix-build", "--no-out-link", "--expr", NIX_EXPR],
+        NIX_BUILD_CMD,
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        die(f"nix-build failed (rc={proc.returncode}):\n{proc.stderr}")
+        die(f"nix build failed (rc={proc.returncode}):\n{proc.stderr}")
     out = proc.stdout.strip().splitlines()[-1].strip()
     binary = os.path.join(out, "bin", "review-bot-review-local")
     if not os.path.exists(binary):
@@ -354,7 +360,7 @@ def main(argv=None):
     ap.add_argument(
         "--binary",
         default="",
-        help="path to review-bot-review-local (default: nix-build the package)",
+        help="path to review-bot-review-local (default: nix build .#default)",
     )
     args = ap.parse_args(argv)
     if args.runs < 1:

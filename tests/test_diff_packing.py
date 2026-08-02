@@ -76,11 +76,26 @@ def scratch_dir():
         shutil.rmtree(path, ignore_errors=True)
 
 
+# Every git this file runs must be insulated from the developer's own config, not just
+# from the system one. The golden fixture records raw `git diff` bytes, and a global
+# `core.abbrev` silently rewrites the `index a..b` hashes — so without this the suite
+# passes in CI and under `nix flake check` (where default.nix pins HOME and
+# GIT_CONFIG_GLOBAL) while failing from a checkout, and the failure message would talk
+# the developer into committing a config-tainted golden. The other suites
+# (test_merge_base, test_head_sync, test_checkout_isolation) already pin both.
+GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+}
+
+
+def git_env():
+    return {**os.environ, **GIT_ENV}
+
+
 class _Auth:
     def env(self):
-        e = dict(os.environ)
-        e["GIT_CONFIG_NOSYSTEM"] = "1"
-        return e
+        return git_env()
 
 
 class _Args:
@@ -116,7 +131,7 @@ class RecordingCheckout:
 def _git(wt, *args):
     return subprocess.run(
         [GIT, "-C", wt, *args], check=True, capture_output=True, text=True,
-        errors="replace",
+        errors="replace", env=git_env(),
     ).stdout
 
 
@@ -125,7 +140,7 @@ def make_multi_file_tree(parent, payloads):
     payloads[i] 'x' characters. Returns (worktree, base_sha)."""
     wt = os.path.join(parent, "private-worktree")
     os.makedirs(wt)
-    subprocess.run([GIT, "init", "-q", wt], check=True)
+    subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
     for i in range(len(payloads)):
         with open(os.path.join(wt, f"file{i}.txt"), "w") as f:
             f.write("x\n")
@@ -440,7 +455,7 @@ def make_edge_case_tree(parent):
     """A tree exercising every per-file diff shape that is not a plain edit."""
     wt = os.path.join(parent, "edge-worktree")
     os.makedirs(wt)
-    subprocess.run([GIT, "init", "-q", wt], check=True)
+    subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
     with open(os.path.join(wt, "renamed-from.txt"), "w") as f:
         f.write("a\n" * 20)
     with open(os.path.join(wt, "deleted.txt"), "w") as f:
@@ -510,7 +525,7 @@ def test_handles_renames_deletions_modes_binaries_and_odd_names():
 def make_undecodable_tree(parent, include_source=True):
     wt = os.path.join(parent, "undecodable-worktree")
     os.makedirs(wt)
-    subprocess.run([GIT, "init", "-q", wt], check=True)
+    subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
     _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
     base = _git(wt, "rev-parse", "HEAD").strip()
     if include_source:
@@ -624,44 +639,94 @@ def test_undecodable_chunks_are_disclosed_but_never_inlined():
     print("ok 13. undecodable chunks are marked and excluded, including all-undecodable input")
 
 
-def test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte():
+GOLDEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "fixtures", "diff_packing_modes.json")
+
+
+def _redact_merge_base(text, base):
+    """Blank the one token that legitimately varies between runs.
+
+    The file-list and partial hints embed the merge base ("run `git diff <sha>..HEAD`"),
+    and the fixture worktree is built fresh each run, so its commit sha is new every
+    time. Blob hashes in the `index a..b` lines are NOT redacted: those are derived
+    from file content, so they are stable and worth pinning. Only the commit sha moves.
+    """
+    for n in (len(base), 12, 8, 7):
+        text = text.replace(base[:n], "<merge-base>")
+    return text
+
+
+def zero_undecodable_outputs(tmp):
+    """Every emitted byte of the four zero-undecodable modes, keyed by mode label.
+
+    The fixture the caller compares against is deliberately a snapshot of the OUTPUT,
+    not of an old review.py: an implementation baseline can only be read out of git
+    history (so it cannot run in a sandbox, a shallow clone or an export) and cannot be
+    updated when a wording change is intended — you would have to repoint it at a newer
+    commit, silently redefining what is being asserted. A golden regenerates by intent
+    (`python3 tests/test_diff_packing.py --update-goldens`) and shows exactly what moved.
+    """
+    review = fresh_review(name="review_diff_packing_golden")
+    wt, base = make_multi_file_tree(tmp, [800, 300, 800, 300])
+    total = len(diff_text(wt, base))
+    selector = os.path.join(tmp, "selector.py")
+    with open(selector, "w") as f:
+        f.write("import json, sys\n")
+        f.write("sys.stdin.read()\n")
+        f.write("print(json.dumps({'files': ['file3.txt', 'file2.txt', "
+                "'file1.txt', 'file0.txt']}))\n")
+
+    cases = [
+        ("inlined", total, [], False),
+        ("partial", total - 1, [], False),
+        ("partial selected", total - 1, [sys.executable, selector], True),
+        ("file-list", 1, [], False),
+    ]
+    observed = {}
+    for label, cap, select_cmd, expect_selected in cases:
+        review.DIFF_INLINE_CAP = cap
+        review.SELECT_CMD = list(select_cmd)
+        with contextlib.redirect_stderr(io.StringIO()):
+            block, mode, _stats = review.changed_files_block(wt, base, _Auth())
+        assert mode.selected is expect_selected, (label, mode)
+        observed[label] = {
+            "block": _redact_merge_base(block, base),
+            "footer_word": mode.footer_word,
+            "journal_phrase": _redact_merge_base(mode.journal_phrase, base),
+        }
+    # A redaction that silently stops matching would turn every golden vacuous, so
+    # assert the token really was present where the renderer is supposed to emit it.
+    assert "<merge-base>" in observed["file-list"]["block"], observed["file-list"]
+    return observed
+
+
+def update_goldens():
     with scratch_dir() as tmp:
-        baseline_path = os.path.join(tmp, "review-f3f7611.py")
-        baseline_source = _git(REPO_ROOT, "show", "f3f7611:review.py")
-        with open(baseline_path, "w") as f:
-            f.write(baseline_source)
-        baseline = fresh_review(baseline_path, "review_diff_packing_baseline")
-        current = fresh_review(name="review_diff_packing_current")
+        observed = zero_undecodable_outputs(tmp)
+    os.makedirs(os.path.dirname(GOLDEN_FILE), exist_ok=True)
+    with open(GOLDEN_FILE, "w") as f:
+        json.dump(observed, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"wrote {GOLDEN_FILE} ({len(observed)} modes)")
 
-        wt, base = make_multi_file_tree(tmp, [800, 300, 800, 300])
-        total = len(diff_text(wt, base))
-        selector = os.path.join(tmp, "selector.py")
-        with open(selector, "w") as f:
-            f.write("import json, sys\n")
-            f.write("sys.stdin.read()\n")
-            f.write("print(json.dumps({'files': ['file3.txt', 'file2.txt', "
-                    "'file1.txt', 'file0.txt']}))\n")
 
-        cases = [
-            ("inlined", total, [], False),
-            ("partial", total - 1, [], False),
-            ("partial selected", total - 1, [sys.executable, selector], True),
-            ("file-list", 1, [], False),
-        ]
-        for label, cap, select_cmd, expect_selected in cases:
-            observed = []
-            for review in (baseline, current):
-                review.DIFF_INLINE_CAP = cap
-                review.SELECT_CMD = list(select_cmd)
-                with contextlib.redirect_stderr(io.StringIO()):
-                    block, mode, _stats = review.changed_files_block(wt, base, _Auth())
-                observed.append((block, mode.footer_word, mode.journal_phrase))
-                assert mode.selected is expect_selected, (label, mode)
-            assert observed[1] == observed[0], (
-                f"{label} output changed from f3f7611:\n"
-                f"baseline={observed[0]!r}\ncurrent={observed[1]!r}"
-            )
-    print("ok 14. zero-undecodable prompt/footer/journal bytes match f3f7611 in all modes")
+def test_zero_undecodable_outputs_match_the_goldens():
+    with open(GOLDEN_FILE) as f:
+        expected = json.load(f)
+    with scratch_dir() as tmp:
+        observed = zero_undecodable_outputs(tmp)
+    # A missing mode must fail as loudly as a changed one — comparing only the
+    # shared keys would let a dropped mode pass as agreement.
+    assert set(observed) == set(expected), (sorted(observed), sorted(expected))
+    for label in sorted(expected):
+        assert observed[label] == expected[label], (
+            f"{label} output changed. If the change is intended, regenerate with\n"
+            f"  python3 tests/test_diff_packing.py --update-goldens\n"
+            f"and review the fixture diff.\n"
+            f"golden={expected[label]!r}\nobserved={observed[label]!r}"
+        )
+    print("ok 14. zero-undecodable prompt/footer/journal bytes match the goldens "
+          "in all four modes")
 
 
 def test_literal_replacement_char_is_not_undecodable():
@@ -675,7 +740,7 @@ def test_literal_replacement_char_is_not_undecodable():
     with scratch_dir() as tmp:
         wt = os.path.join(tmp, "mixed-worktree")
         os.makedirs(wt)
-        subprocess.run([GIT, "init", "-q", wt], check=True)
+        subprocess.run([GIT, "init", "-q", wt], check=True, env=git_env())
         _git(wt, *GIT_ID, "commit", "--allow-empty", "-qm", "base")
         base = _git(wt, "rev-parse", "HEAD").strip()
         # Valid UTF-8 that happens to contain the replacement character, the way any
@@ -742,7 +807,7 @@ TESTS = [
     test_git_replaces_undecodable_diff_bytes,
     test_engines_replace_undecodable_output_bytes,
     test_undecodable_chunks_are_disclosed_but_never_inlined,
-    test_zero_undecodable_outputs_match_pre_fix_tree_byte_for_byte,
+    test_zero_undecodable_outputs_match_the_goldens,
     test_literal_replacement_char_is_not_undecodable,
     test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character,
 ]
@@ -752,6 +817,9 @@ def main():
     if not GIT:
         print("git not found on PATH", file=sys.stderr)
         return 1
+    if "--update-goldens" in sys.argv[1:]:
+        update_goldens()
+        return 0
     for test in TESTS:
         test()
     print(f"\nall {len(TESTS)} diff-packing tests passed")

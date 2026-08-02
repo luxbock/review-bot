@@ -23,15 +23,94 @@
 # The harness binaries (`claude` / `codex`) are resolved from PATH at RUNTIME
 # (of the SERVICE, post-split), not baked in. `git` IS baked in so the routine
 # doesn't depend on the runtime PATH for it.
+#
+# This file is the ONE package definition. nixos-config consumes it directly
+# (`flake = false` input + callPackage in pkgs/default.nix, so the deployment
+# builds it with the HOST's nixpkgs); ./flake.nix is a thin, nixpkgs-only entry
+# point that callPackages this same file for local and in-VM work. Neither
+# derives from the other — keep the build logic here.
 {
+  lib,
   runCommand,
   python3,
   git,
 }:
+
+let
+  # Everything the SUITE needs, and nothing else — this list is consumed by the
+  # deployment's callPackage too, so it stays free of dev ergonomics (those live
+  # in flake.nix's devShell, which extends this). Exhaustive on purpose: a factory
+  # VM worker gets the whole suite environment from `nix develop` alone, with no
+  # host-provided extras and no ambient channel. The engines (`claude` / `codex`)
+  # are deliberately absent — no test may reach a live model, so a suite that can
+  # find one is a bug surface.
+  testInputs = [
+    python3 # the whole codebase is stdlib-only — no site-packages needed
+    git # the suite builds real repos and worktrees; review.py shells out to it
+  ];
+
+  # The tests import review.py IN-TREE (placeholders patched at import time) and
+  # resolve the prompt files relative to the repo root, so the check derivation
+  # needs the real layout rather than a handful of copied scripts. Listed
+  # explicitly: a new prompt file must be added here as well as to the
+  # substituteInPlace list below, and forgetting shows up as a failing check.
+  testTree = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./review.py
+      ./client.py
+      ./serve.py
+      ./poll.py
+      ./feedback.py
+      ./review-prompt.md
+      ./verify-prompt.md
+      ./synthesis-prompt.md
+      ./triage-prompt.md
+      ./triage-verify-prompt.md
+      ./triage-synthesis-prompt.md
+      ./audit-prompt.md
+      ./audit-verify-prompt.md
+      ./audit-synthesis-prompt.md
+      ./select-prompt.md
+      ./tests # includes tests/fixtures — the diff-packing goldens live there
+      ./tools
+    ];
+  };
+
+in
 runCommand "review-bot"
   {
     meta.description = "Automated Forgejo PR reviewer (review-bot identity) — engine-agnostic review routine";
     meta.mainProgram = "review-bot-review";
+
+    passthru = {
+      inherit testInputs;
+
+      # Every test file, run the way the repo runs them. This is what
+      # `nix flake check` and the packaged-build gate share, so a worker can
+      # prove the suite hermetically without a host round-trip.
+      tests =
+        runCommand "review-bot-tests"
+          {
+            nativeBuildInputs = testInputs;
+          }
+          ''
+            cp -r ${testTree} src
+            chmod -R u+w src
+            cd src
+            # git refuses to operate without an identity or a HOME to read.
+            export HOME="$TMPDIR"
+            export GIT_CONFIG_GLOBAL="$TMPDIR/gitconfig"
+            git config --global user.name "review-bot tests"
+            git config --global user.email "tests@example.invalid"
+            git config --global init.defaultBranch main
+            for t in tests/test_*.py; do
+              echo "== $t"
+              python3 "$t"
+            done
+            touch $out
+          '';
+    };
   }
   ''
     # The in-process pipeline: installed once under lib/ so the serve entry point

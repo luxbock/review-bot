@@ -7,3 +7,7 @@ __pycache__/
 /.claude/
 # finder_ab.py's default --out, written into the checkout it is run from
 /finder-ab.jsonl
+
+# nix build's default out-link
+/result
+/result-*

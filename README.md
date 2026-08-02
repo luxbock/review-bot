@@ -339,8 +339,9 @@ It **never posts** — every invocation carries `--print-only` — and it drives
 the client cannot carry the cap (`review-bot-serve` whitelists request fields
 and honours engine/env settings only from its own trusted environment). Running
 local therefore needs the forge token plus live engine credentials. By default
-it `nix-build`s the package and uses `$out/bin/review-bot-review-local`;
-`--binary PATH` overrides that.
+it builds the package with `nix build .#default` — the repo's own flake, so both arms
+come from the nixpkgs pinned in `flake.lock` — and uses
+`$out/bin/review-bot-review-local`; `--binary PATH` overrides that.
 
 Every run appends one JSON object to `--out` (harness, forced cap, run index,
 exit status, the draft→surviving counts and diff mode parsed from the rendered
@@ -502,6 +503,48 @@ strictly read-only: it never posts, labels, or closes.
 Token source, in order: `FORGEJO_TOKEN` env → `REVIEW_BOT_TOKEN_FILE` / the
 standard token-file candidates → else an error with guidance. Any token that
 can read the repo works.
+
+## Building and testing
+
+The repo carries a deliberately nixpkgs-only `flake.nix`. From a checkout:
+
+```sh
+nix build .#default        # the packaged artifact
+nix flake check            # the package AND the full test suite, hermetically
+nix develop                # the project toolchain — python3, git, curl, jq, nixfmt
+nix fmt                    # format the .nix files
+```
+
+The suite also runs straight from a checkout, which is the faster loop while editing:
+
+```sh
+python3 tests/test_empty_draft.py                       # one file
+for t in tests/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
+```
+
+`review.py` in-tree carries the build-time `@…@` placeholders and is **not runnable
+directly** — the tests load it as a module and patch them (`fresh_review`), and
+`nix build` substitutes them for real. `bin/review-bot-review-local` in the built
+output is the runnable one.
+
+Two things the flake is deliberately *not*: it is not how the deployment builds this.
+nixos-config pins the repo as a `flake = false` source input and callPackages
+`default.nix` with the host's own nixpkgs, which keeps the service on one coherent
+package set. And it is not a second package definition — `default.nix` remains the only
+one; the flake just callPackages it with a pinned nixpkgs so the build is reproducible
+in a local checkout or a factory VM, where no ambient `<nixpkgs>` channel can be relied
+on.
+
+`tests/fixtures/diff_packing_modes.json` holds golden snapshots of the prompt block,
+footer word and journal phrase for the four zero-undecodable diff-input modes. When a
+wording change is intended, regenerate and review the fixture diff:
+
+```sh
+python3 tests/test_diff_packing.py --update-goldens
+```
+
+The merge-base sha is redacted to `<merge-base>` (the fixture worktree is rebuilt each
+run); the `index a..b` blob hashes are content-derived, so they stay pinned.
 
 ## Status
 
