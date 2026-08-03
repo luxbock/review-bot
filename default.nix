@@ -72,6 +72,10 @@ let
       ./audit-verify-prompt.md
       ./audit-synthesis-prompt.md
       ./select-prompt.md
+      # The suite asserts README prose against the code it describes (the diff-cap
+      # doc-coupling test), so the check derivation needs it. A README edit therefore
+      # rebuilds this check — which is the point: that is the drift being gated.
+      ./README.md
       ./tests # includes tests/fixtures — the diff-packing goldens live there
       ./tools
     ];

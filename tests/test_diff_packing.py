@@ -793,6 +793,62 @@ def test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character():
     print("ok 16. undecodability keys on bytes, so a literal U+FFFD stays inlinable")
 
 
+DEPLOYED_DIFF_CAP = 250000
+"""What nixos-config's hosts/convox/review-bot-service.nix sets REVIEW_BOT_DIFF_CAP to.
+
+Not importable from here — it lives in another repo — so it is restated, and the test
+below is what makes the restatement load-bearing rather than a stale comment.
+"""
+
+
+def test_default_cap_matches_the_deployed_service_and_the_readme():
+    """The unforced default must equal what production runs, and the README must say so.
+
+    These drifted apart silently: the default stayed at the nixos-config import's 60000
+    while the deployed unit was tuned to 250000, so `review-bot-review-local` — the
+    binary tools/finder_ab.py drives — showed the finder a quarter of production's diff.
+    An A/B measurement taken that way describes an instrument nobody runs, and nothing
+    failed for months. A restated constant with no test is exactly the drift class this
+    repo keeps getting bitten by, so pin all three faces of it here.
+    """
+    env = dict(os.environ)
+    os.environ.pop("REVIEW_BOT_DIFF_CAP", None)
+    try:
+        review = fresh_review(name="review_default_cap_test")
+    finally:
+        os.environ.clear()
+        os.environ.update(env)
+    assert review.DIFF_INLINE_CAP == DEPLOYED_DIFF_CAP, review.DIFF_INLINE_CAP
+
+    readme = open(os.path.join(REPO_ROOT, "README.md"), encoding="utf-8").read()
+    claim = f"default {DEPLOYED_DIFF_CAP} chars"
+    assert claim in readme, f"README no longer states {claim!r}"
+    # The journal example must stay coherent with the cap it prints: an over-cap diff is
+    # what produces a `partial` line, so an example whose size fits under the cap would
+    # illustrate a mode it could not actually reach.
+    example = re.search(r"diff (\d+) chars vs cap (\d+) — (\d+) of (\d+) files inlined",
+                        readme)
+    assert example, "README's partial journal example is gone or reshaped"
+    total, cap, inlined_files, all_files = (int(g) for g in example.groups())
+    assert cap == DEPLOYED_DIFF_CAP, cap
+    assert total > cap, (total, cap)
+    assert inlined_files < all_files, (inlined_files, all_files)
+
+    # The OTHER example — the undecodable-file branch — asserts `selection disabled:
+    # under cap` about its own size, so that size must actually be under the cap. At the
+    # old 60000 default it was not (98211 > 60000): the example claimed "under cap" for
+    # an over-cap diff, and raising the default to 250000 fixed it by ACCIDENT. Pin it,
+    # or the next cap change silently re-breaks the same sentence.
+    under = re.search(r"— \d+ of \d+ files inlined, (\d+) of (\d+) chars, \d+ not valid"
+                      r" UTF-8\n\s*\(selection disabled: under cap\)", readme)
+    assert under, "README's under-cap undecodable example is gone or reshaped"
+    under_inlined, under_total = (int(g) for g in under.groups())
+    assert under_total < DEPLOYED_DIFF_CAP, (under_total, DEPLOYED_DIFF_CAP)
+    assert under_inlined < under_total, (under_inlined, under_total)
+    print(f"ok 17. the default cap, the deployed unit and the README all say "
+          f"{DEPLOYED_DIFF_CAP}")
+
+
 TESTS = [
     test_split_is_lossless_and_per_file,
     test_boundary_unchanged_and_over_cap_packs,
@@ -810,6 +866,7 @@ TESTS = [
     test_zero_undecodable_outputs_match_the_goldens,
     test_literal_replacement_char_is_not_undecodable,
     test_undecodability_is_decided_by_bytes_not_by_a_sentinel_character,
+    test_default_cap_matches_the_deployed_service_and_the_readme,
 ]
 
 
