@@ -284,7 +284,8 @@ and only when the diff is over the cap**, a deliberately cheap engine ranks the
 files first (`REVIEW_BOT_SELECT_CMD`, default
 `claude -p --output-format json --model haiku`; empty disables the stage). It is
 handed metadata only — `--stat`, each file's diff header and its `@@` hunk
-headers for inlinable files, and the repo's convention files — never hunk bodies,
+headers for inlinable files, and the NAMES of the repo's convention files (the list
+only — this stage has no tools and never opens them) — never hunk bodies,
 and it returns a ranked list of paths with a one-clause reason each. Undecodable
 chunks are removed before this stage, so they cannot consume ranking or inline
 budget.
