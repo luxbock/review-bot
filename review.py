@@ -113,10 +113,27 @@ HEAD_SYNC_BASE_SECS = float(os.environ.get("REVIEW_BOT_HEAD_SYNC_BASE_SECS", "1.
 # The harness commands are env-overridable because the exact CLI flags for headless
 # review (esp. tool-permission flags) may need tuning against the live engines —
 # validate with --dry-run, then adjust REVIEW_BOT_CLAUDE_CMD / _CODEX_CMD if needed.
+#
+# `--settings '{"disableAllHooks": true}'` and `--strict-mcp-config` are NOT tuning:
+# they are a SECURITY BOUNDARY (issue #493) and must not be trimmed out of the command
+# string. Every claude invocation runs with cwd inside the per-run worktree checked out
+# at the PR HEAD, so a `.claude/settings.json` carrying hooks, or a repo-root
+# `.mcp.json` declaring a stdio server, is code the REVIEWED repo controls. Both were
+# verified to execute as the review-bot user with no model involvement, no prompt, no
+# trust dialog and no permission prompt. No prompt hardening can reach either path — a
+# hook fires before the model sees the prompt and an MCP server launches at session
+# start — and `--allowedTools` does not gate them, because hooks and MCP servers are
+# session-level rather than tool-level. The CLI flag also beats a reviewed repo that
+# sets `"disableAllHooks": false` in its own settings. Keep both flags on EVERY claude
+# command line, this one and SELECT_CMD below.
+# The settings value is an inline JSON string, deliberately not a path: the default has
+# to work outside the nix unit too, so it cannot point at a store path. `claude --help`
+# documents --settings as taking a settings JSON file "or a JSON string".
 CLAUDE_CMD = shlex.split(
     os.environ.get(
         "REVIEW_BOT_CLAUDE_CMD",
-        "claude -p --output-format json --allowedTools Read,Grep,Glob,Bash",
+        "claude -p --output-format json --allowedTools Read,Grep,Glob,Bash"
+        " --settings '{\"disableAllHooks\": true}' --strict-mcp-config",
     )
 )
 CODEX_CMD = shlex.split(os.environ.get("REVIEW_BOT_CODEX_CMD", "codex exec --skip-git-repo-check -"))
@@ -125,8 +142,19 @@ CODEX_CMD = shlex.split(os.environ.get("REVIEW_BOT_CODEX_CMD", "codex exec --ski
 # the ranking slightly wrong is a worse packing order, never a wrong verdict. Separate
 # from REVIEW_BOT_CLAUDE_CMD so it can be tuned (or disabled with an empty value)
 # without touching the finder. No tool access: it is handed everything it may look at.
+#
+# It carries the same two SECURITY BOUNDARY flags as CLAUDE_CMD, and for the same
+# reason (issue #493) — do not trim them here either. Granting this stage no tools does
+# NOT make it inert: it runs in the same PR-head worktree, and against this exact
+# command line a repo-controlled SessionStart hook fired and a repo-root `.mcp.json`
+# server was executed. Hooks and MCP servers are session-level, so the absence of
+# --allowedTools buys nothing; hardening only the finder would leave this path live.
 SELECT_CMD = shlex.split(
-    os.environ.get("REVIEW_BOT_SELECT_CMD", "claude -p --output-format json --model haiku")
+    os.environ.get(
+        "REVIEW_BOT_SELECT_CMD",
+        "claude -p --output-format json --model haiku"
+        " --settings '{\"disableAllHooks\": true}' --strict-mcp-config",
+    )
 )
 # A ranking of metadata is cheap; a stuck selection stage must never hold a review
 # hostage. Well under ENGINE_TIMEOUT on purpose.

@@ -281,14 +281,27 @@ three-file change the finder had never been shown.
 Packing in source order is arbitrary when the change is much larger than the cap
 — the diff's own order says nothing about which files repay reading. So **when
 and only when the diff is over the cap**, a deliberately cheap engine ranks the
-files first (`REVIEW_BOT_SELECT_CMD`, default
-`claude -p --output-format json --model haiku`; empty disables the stage). It is
-handed metadata only — `--stat`, each file's diff header and its `@@` hunk
+files first (`REVIEW_BOT_SELECT_CMD`; empty disables the stage), by default:
+
+```
+claude -p --output-format json --model haiku --settings '{"disableAllHooks": true}' --strict-mcp-config
+```
+
+It is handed metadata only — `--stat`, each file's diff header and its `@@` hunk
 headers for inlinable files, and the NAMES of the repo's convention files (the list
 only — this stage has no tools and never opens them) — never hunk bodies,
 and it returns a ranked list of paths with a one-clause reason each. Undecodable
 chunks are removed before this stage, so they cannot consume ranking or inline
 budget.
+
+Granting the stage no tools is *not* what keeps it from executing the reviewed
+repo's code, which is why it carries the same two hardening flags as the finder
+(issue #493): it runs in the same PR-head worktree, and hooks declared in a
+`.claude/settings.json` and stdio servers declared in a repo-root `.mcp.json` are
+**session-level**, so they fire regardless of `--allowedTools`. `--settings
+'{"disableAllHooks": true}'` and `--strict-mcp-config` close both paths on every
+claude command line the bot runs; they are a security boundary, not tuning, and
+must not be dropped when a command string is edited.
 
 The ranking decides **order, never scope**:
 
@@ -445,8 +458,12 @@ Fields are whitelisted (an unknown field is a hard error):
 
 Deliberately **not** accepted: `repo_dir` (the service must not read arbitrary
 caller paths) and engine-command overrides (`REVIEW_BOT_CLAUDE_CMD` /
-`REVIEW_BOT_CODEX_CMD` are honored only from the service's own trusted unit
-environment, never from the request).
+`REVIEW_BOT_SELECT_CMD` / `REVIEW_BOT_CODEX_CMD` are honored only from the
+service's own trusted unit environment, never from the request). Note what that
+trust means now that the claude defaults carry `--settings
+'{"disableAllHooks": true}' --strict-mcp-config`: an override replaces the
+**whole** command, flags included, so a unit that sets one must repeat them or it
+silently re-opens the paths of issue #493.
 
 Response: NDJSON events on the socket — optional
 `{"type":"log","message":…}` progress lines, then exactly one final
