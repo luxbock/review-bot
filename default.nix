@@ -76,6 +76,10 @@ let
       # doc-coupling test), so the check derivation needs it. A README edit therefore
       # rebuilds this check — which is the point: that is the drift being gated.
       ./README.md
+      # Same reason as README.md: the suite pins the SKILL's engine-command gotcha
+      # against the overrides review.py actually reads, so an edit to it must rebuild
+      # this check rather than drift away from the code unnoticed.
+      ./skills
       ./tests # includes tests/fixtures — the diff-packing goldens live there
       ./tools
     ];
