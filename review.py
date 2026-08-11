@@ -112,7 +112,9 @@ HEAD_SYNC_BASE_SECS = float(os.environ.get("REVIEW_BOT_HEAD_SYNC_BASE_SECS", "1.
 
 # The harness commands are env-overridable because the exact CLI flags for headless
 # review (esp. tool-permission flags) may need tuning against the live engines —
-# validate with --dry-run, then adjust REVIEW_BOT_CLAUDE_CMD / _CODEX_CMD if needed.
+# validate with --dry-run, then adjust REVIEW_BOT_CLAUDE_CMD, REVIEW_BOT_SELECT_CMD or
+# REVIEW_BOT_CODEX_CMD if needed — the selection stage below is a third claude command
+# line and is tuned (or disabled) separately from this one.
 #
 # `--settings '{"disableAllHooks": true}'` and `--strict-mcp-config` are NOT tuning:
 # they are a SECURITY BOUNDARY (issue #493) and must not be trimmed out of the command
