@@ -1216,12 +1216,34 @@ def convention_files(cdir):
 
 
 # ── prompt filling ─────────────────────────────────────────────────────────────
+# Every placeholder in the prompt vocabulary is a bare identifier: MERGE_BASE,
+# DIFF_OR_FILE_LIST, CONVENTION_FILES, FOCUS, CONFIDENCE_BAR, REVIEW_JSON,
+# REVIEW_JSON_LIST, N, DEFAULT_BRANCH, REPO, ISSUE_BLOCK, STAT, FILE_HEADERS.
+# (The @…@ tokens are a DIFFERENT mechanism — nix substitutes those at build time.)
+PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
 def fill(template_path, mapping):
+    """Substitute {{KEY}} placeholders in a prompt template, in a SINGLE pass.
+
+    The old implementation ran one `str.replace` per key over an accumulating
+    string, so a value substituted early was rescanned by every later key — and
+    DIFF_OR_FILE_LIST carries the UNTRUSTED diff. A `{{CONVENTION_FILES}}` token
+    occurring inside the diff was therefore expanded as if it were template syntax,
+    and the engine reviewed source that exists nowhere (issue #49). Reordering the
+    mapping is not a fix: any value may contain any key's token, so no order is
+    safe. One scan of the ORIGINAL text is what removes the rescan.
+
+    Two properties this depends on:
+      * the replacement is a FUNCTION, never a string — `re` would otherwise
+        interpret backslash escapes (`\\1`, `\\g<0>`) inside the *value*, and the
+        value is a diff full of backslashes;
+      * an unknown token yields `m.group(0)`, i.e. passes through unchanged rather
+        than silently becoming empty or raising.
+    """
     with open(template_path) as f:
         text = f.read()
-    for k, v in mapping.items():
-        text = text.replace("{{" + k + "}}", v)
-    return text
+    return PLACEHOLDER_RE.sub(lambda m: mapping.get(m.group(1), m.group(0)), text)
 
 
 # ── engine invocation ──────────────────────────────────────────────────────────
