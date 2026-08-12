@@ -25,8 +25,12 @@ Request fields (whitelist — any unknown field is a hard error):
 
 Deliberately NOT accepted: repo_dir (would let a caller point the service at an
 arbitrary path readable by the service user) and any engine-command override —
-REVIEW_BOT_CLAUDE_CMD / REVIEW_BOT_CODEX_CMD are honoured from the SERVICE's
-own environment (trusted, set by the unit), never from the request.
+REVIEW_BOT_CLAUDE_CMD / REVIEW_BOT_SELECT_CMD / REVIEW_BOT_CODEX_CMD are honoured
+from the SERVICE's own environment (trusted, set by the unit), never from the
+request. That trust carries weight since nixos-config#493: the claude defaults
+now carry --settings '{"disableAllHooks": true}' --strict-mcp-config, and an
+override replaces the WHOLE command, so a unit that sets one must repeat them or
+it silently re-opens the repo-controlled hook and MCP paths those flags close.
 
 Response events (NDJSON, one object per line on stdout):
   {"type":"log","message":<string>}                               (progress)

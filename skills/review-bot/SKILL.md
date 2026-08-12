@@ -137,9 +137,14 @@ Resolve `<owner>/<repo>` from context (the PR/issue's repo). For nixos-config th
   re-auth.
 - **Engine flags may need tuning — service-side.** If `--harness claude`/`codex` hangs
   on a permission prompt or returns no JSON, the `REVIEW_BOT_CLAUDE_CMD` /
-  `REVIEW_BOT_CODEX_CMD` tuning knobs now live on the review-bot service unit
-  (`hosts/convox/review-bot-service.nix`), not in your environment — flag it to olli
-  rather than guessing repeatedly; setting those vars locally does nothing.
+  `REVIEW_BOT_SELECT_CMD` / `REVIEW_BOT_CODEX_CMD` knobs are the lever — but they are
+  read from the review-bot **service's** own environment, never from yours and never
+  from the socket request, so setting them locally does nothing. Their values live in
+  `review.py`'s defaults; `hosts/convox/review-bot-service.nix` currently overrides
+  none of them. Flag it to olli rather than guessing repeatedly. Note the claude
+  defaults carry `--settings '{"disableAllHooks": true}' --strict-mcp-config` as a
+  security boundary (nixos-config#493) and an override replaces the *whole* command,
+  so any retune has to repeat them.
 - **Never merge, approve, close, label, or transfer on the forge** — review-bot only
   comments (its token has no `write:repository`). A triage only *recommends* an action
   (e.g. "close as answered", "belongs in repo X"); olli decides and acts.
